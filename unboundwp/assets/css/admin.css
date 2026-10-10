@@ -1,0 +1,90 @@
+/* UnboundWP admin styles, plain and dependency-free. */
+.uwp-wrap { max-width: 900px; }
+.uwp-logview {
+	background: #1e1e1e;
+	color: #d4d4d4;
+	padding: 14px 16px;
+	border-radius: 6px;
+	max-height: 70vh;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-all;
+	font-size: 12px;
+	line-height: 1.5;
+}
+.uwp-card {
+	background: #fff;
+	border: 1px solid #ccd0d4;
+	border-radius: 6px;
+	padding: 18px 20px;
+	margin: 16px 0;
+	box-shadow: 0 1px 1px rgba(0,0,0,.04);
+}
+.uwp-list { list-style: disc; margin-left: 20px; }
+.uwp-bar {
+	background: #e5e5e5;
+	border-radius: 4px;
+	height: 16px;
+	overflow: hidden;
+	margin: 10px 0;
+}
+.uwp-fill {
+	background: #2271b1;
+	height: 100%;
+	width: 0%;
+	transition: width .3s ease;
+}
+.uwp-fill.done { background: #46b450; }
+.uwp-done-head { font-size: 15px; }
+.uwp-notes { margin: 8px 0; }
+.uwp-notes > summary { cursor: pointer; font-weight: 600; }
+.uwp-notes p { white-space: pre-wrap; }
+.uwp-opts {
+	border: 1px solid #dcdcde;
+	border-radius: 6px;
+	padding: 12px 14px;
+	margin: 12px 0;
+	background: #fcfcfc;
+}
+.uwp-opts legend { font-weight: 600; padding: 0 6px; }
+.uwp-opt {
+	display: flex;
+	gap: 10px;
+	align-items: flex-start;
+	padding: 8px 0;
+}
+.uwp-opt + .uwp-opt { border-top: 1px solid #f0f0f1; }
+.uwp-opt input[type="checkbox"] { margin-top: 3px; }
+#uwp-import-done-actions { margin: 10px 0; }
+/* WordPress core forces .button to display:inline-block, which beats the
+   UA [hidden] style, so a hidden button needs an explicit rule. Without
+   this, Cancel shows next to Export Now even when no job is running. */
+#uwp-export-cancel[hidden] { display: none !important; }
+.uwp-drop {
+	border: 2px dashed #8c8f94;
+	border-radius: 8px;
+	padding: 28px;
+	text-align: center;
+	background: #f6f7f7;
+	margin: 12px 0;
+}
+.uwp-drop.over { border-color: #2271b1; background: #f0f6fc; }
+.uwp-progress { margin-top: 12px; }
+.uwp-verify-box { margin-top: 12px; }
+/* Keep the row of action buttons evenly spaced (one line when it fits, neat wrap when not). */
+.uwp-actions .button {
+	margin: 3px 6px 3px 0 !important;
+	vertical-align: middle;
+}
+.uwp-actions .button:last-child { margin-right: 0 !important; }
+@supports (display: flex) {
+	.uwp-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		align-items: center;
+		min-width: 280px;
+	}
+	.uwp-actions .button { margin: 0 !important; }
+}
+#uwp-export-result a, #uwp-import-result a { font-weight: 600; }

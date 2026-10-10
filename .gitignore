@@ -1,0 +1,14 @@
+# Build artifacts - never commit release zips
+*.zip
+*.uwp
+*.wpress
+
+# WordPress working dirs (runtime data, not source)
+unboundwp-backups/
+unboundwp-temp/
+
+# OS / editor junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
