@@ -118,7 +118,7 @@ if ( ! function_exists( 'uwp_temp_dir' ) ) {
 // is what caused the historical "Cannot redeclare uwp_backups_dir()"
 // bootstrap fatals - the self-healer keys on file hash, this is the belt.
 if ( ! defined( 'UWP_MU_LOADER_VERSION' ) ) {
-	define( 'UWP_MU_LOADER_VERSION', '1.0.0' );
+	define( 'UWP_MU_LOADER_VERSION', '1.0.1' );
 }
 // NOTE: no uwp_ensure_directories() stub here on purpose - with both sides
 // guarded, the first definition wins, and the no-op would shadow the real

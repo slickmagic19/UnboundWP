@@ -75,11 +75,26 @@ The plugin version is defined in two places, keep them in sync:
 
 ## Building a release zip
 
-From the repo root on Windows (PowerShell):
+Do NOT use `Compress-Archive` — it omits the explicit top-level directory
+entry, which breaks installs on some hosts. Build with Python instead
+(forward slashes, explicit `unboundwp/` entry, reproducible order).
+From the repo root:
 
 ```powershell
-Compress-Archive -Path unboundwp -DestinationPath unboundwp-1.0.0.zip -Force
+python -c "import zipfile, pathlib; src=pathlib.Path('unboundwp'); out=pathlib.Path('unboundwp-1.0.1.zip'); dirs=sorted([p for p in src.rglob('*') if p.is_dir()], key=lambda p: p.as_posix()); files=sorted([p for p in src.rglob('*') if p.is_file() and p.name not in ('.DS_Store','Thumbs.db','Desktop.ini') and '__pycache__' not in p.parts], key=lambda p: p.as_posix()); z=zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED); z.writestr('unboundwp/',''); [z.writestr(d.as_posix()+'/','') for d in dirs]; [z.write(f,f.as_posix()) for f in files]; z.close()"
 ```
+
+Then verify before uploading to the GitHub release:
+
+```powershell
+python -c "import zipfile; z=zipfile.ZipFile('unboundwp-1.0.1.zip'); n=z.namelist(); print(len(n),'entries, top-level:',sorted(set(x.split('/')[0] for x in n if '/' in x))); print('explicit unboundwp/:','unboundwp/' in n); print('testzip:',z.testzip())"
+# expect: single top-level `unboundwp`, explicit `unboundwp/` entry, testzip None
+```
+
+Upload the `unboundwp-*.zip` asset to the release — do NOT point users at
+the auto-generated `Source code (zip)`, which nests the plugin two levels
+deep (`UnboundWP-x.y.z/unboundwp/...`) and WordPress rejects with
+"No valid plugins were found."
 
 Release zips (`*.zip`) are git ignored. Do not commit them.
 

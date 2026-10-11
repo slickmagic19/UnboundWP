@@ -4,7 +4,7 @@ Tags: migration, backup, restore, export, import
 Requires at least: 5.8
 Tested up to: 6.8
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -45,6 +45,9 @@ No. The live wp-config.php is never overwritten; an archived one is saved as wp-
 In `wp-content/uploads/unboundwp-backups/`. Temp work goes to `wp-content/uploads/unboundwp-temp/`.
 
 == Changelog ==
+
+= 1.0.1 =
+* Fixed release zip built with explicit top-level `unboundwp/` directory entry so WordPress upload installs reliably on all hosts. No functional changes.
 
 = 1.0.0 =
 * Initial WordPress.org release. Full site export (database plus wp-content plus WordPress core) into one portable `.uwp` file, fully `.wpress` compatible.

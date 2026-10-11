@@ -3,7 +3,7 @@
  * Plugin Name:       UnboundWP - Free Migration & Backup
  * Plugin URI:        https://github.com/slickmagic19/UnboundWP
  * Description:       Free and open-source site export, import, backup and 1-click restore. No size limits, no paywalls. Reads and writes .uwp files (fully .wpress compatible).
- * Version:           1.0.0
+ * Version:           1.0.1
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            UnboundWP Contributors
@@ -29,7 +29,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // strict error display, corrupts ajax JSON responses).
 // ---------------------------------------------------------------------------
 
-defined( 'UWP_VERSION' ) || define( 'UWP_VERSION', '1.0.0' );
+defined( 'UWP_VERSION' ) || define( 'UWP_VERSION', '1.0.1' );
 defined( 'UWP_PLUGIN_FILE' ) || define( 'UWP_PLUGIN_FILE', __FILE__ );
 defined( 'UWP_PLUGIN_DIR' ) || define( 'UWP_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 defined( 'UWP_PLUGIN_URL' ) || define( 'UWP_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
