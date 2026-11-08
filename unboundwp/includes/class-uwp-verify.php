@@ -70,7 +70,12 @@ class UWP_Verify {
 			'encoded'    => ! empty( $package['Encrypted'] ) || ! empty( $package['Compression']['Enabled'] ),
 			'done'       => false,
 		);
+		// Secret in its own guarded file, never in the state JSON.
+		$secret = $state['secret'];
+		unset( $state['secret'] );
 		self::save( $state );
+		UWP_Helpers::job_write_secret( self::STATE_OPTION, $secret );
+		$state['secret'] = $secret; // return value only - not persisted.
 		if ( class_exists( 'UWP_Logger' ) ) {
 			UWP_Logger::prune();
 		}
@@ -124,9 +129,7 @@ class UWP_Verify {
 		}
 
 		if ( empty( $result['done'] ) ) {
-			$state            = self::load();
-			$secret           = ( is_array( $state ) && isset( $state['secret'] ) ) ? (string) $state['secret'] : '';
-			$result['chained'] = UWP_Helpers::chain_self( 'uwp_backup_verify_tick', $secret );
+			$result['chained'] = UWP_Helpers::chain_self( 'uwp_backup_verify_tick', UWP_Helpers::job_get_secret( self::STATE_OPTION ) );
 		}
 		return $result;
 	}
@@ -144,7 +147,7 @@ class UWP_Verify {
 		if ( null === $state ) {
 			throw new Exception( __( 'No verification in progress.', 'unboundwp' ) );
 		}
-		$pinned = UWP_Helpers::job_take_fatal( self::STATE_OPTION );
+		$pinned = UWP_Helpers::job_take_fatal( self::STATE_OPTION, isset( $state['created'] ) ? (int) $state['created'] : 0 );
 		if ( null !== $pinned ) {
 			throw new Exception( sprintf( __( 'The previous step crashed: %s', 'unboundwp' ), $pinned ) );
 		}
@@ -359,6 +362,8 @@ class UWP_Verify {
 		// Keep state for debugging, but the run is over.
 		$state['done'] = true;
 		self::save( $state );
+		// The job can no longer be ticked: drop its bearer secret.
+		UWP_Helpers::job_clear_secret( self::STATE_OPTION );
 		UWP_Helpers::debug_log(
 			sprintf(
 				'verify %s: complete healthy=%s checked=%d errors=%d',

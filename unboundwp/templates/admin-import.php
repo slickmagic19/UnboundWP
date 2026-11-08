@@ -1,7 +1,7 @@
 <div class="wrap uwp-wrap">
 	<h1><?php esc_html_e( 'UnboundWP: Import', 'unboundwp' ); ?></h1>
 	<p class="description">
-		<?php esc_html_e( 'Restore any .uwp or .wpress backup. Uploads are sliced into 2 MB pieces, so there is no file-size limit and no gateway timeouts, ever.', 'unboundwp' ); ?>
+		<?php esc_html_e( 'Restore any .uwp or .wpress backup. Uploads are sliced into small pieces (8 MB, shrinking automatically), so there is no file-size limit and no gateway timeouts, ever.', 'unboundwp' ); ?>
 	</p>
 	<?php UWP_Admin::tabs( 'import' ); ?>
 
@@ -32,6 +32,13 @@
 				<span>
 					<strong><?php esc_html_e( 'Leave plugins inactive', 'unboundwp' ); ?></strong><br>
 					<span class="description"><?php esc_html_e( 'Skip reactivation so you can review and enable plugins yourself afterwards. Safest for unfamiliar backups.', 'unboundwp' ); ?></span>
+				</span>
+			</label>
+			<label class="uwp-opt">
+				<input type="checkbox" id="uwp-opt-skip-replace">
+				<span>
+					<strong><?php esc_html_e( 'Keep the backup&#8217;s original URLs', 'unboundwp' ); ?></strong><br>
+					<span class="description"><?php esc_html_e( 'Use this only when restoring on the same domain. Leave unchecked to rewrite all URLs and paths to this site (normal migration).', 'unboundwp' ); ?></span>
 				</span>
 			</label>
 		</fieldset>

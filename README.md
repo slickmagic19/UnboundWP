@@ -10,10 +10,11 @@ Free, open source WordPress site export, import, backup, and 1-click restore. No
 * **Import** any `.uwp` or `.wpress` backup, including files made by All-in-One WP Migration (plain, gzip, and password protected with AES-256-CBC).
 * **Backups** page: download, 1-click resumable restore, checksum verify, delete.
 * **Logs** page: per job full logs with download and rotation.
-* **No limits**: browser uploads arrive in 2 MB slices, export and import run in small resumable steps with server side chaining. Timeouts and upload limits do not stop a run.
+* **No limits**: browser uploads arrive in auto-shrinking slices, export and import run in small resumable steps with server side chaining. Timeouts and upload limits do not stop a run. Unlike the free edition of All-in-One WP Migration there is **no 300 MB import cap**.
+* **Resumable and self-checking**: job state is written atomically, every archived file carries a CRC32, every restore can resume from the exact byte/file it stopped at, and a failed archive write is rolled back or rebuilt instead of shipping a corrupt backup.
 * **Safe restores**: serialization safe URL replacement, per file CRC32 checks, path traversal protection, quarantined restore with one by one plugin reactivation, theme fallback, permalink self heal, prefix aware 1:1 restores. The live `wp-config.php` is never overwritten.
-* **Diagnostics**: green, amber, and red probes plus a fidelity manifest comparison and homepage smoke test.
-* **WP-CLI**: `wp unboundwp export`.
+* **Diagnostics**: green, amber, and red probes incl. an archive write/read roundtrip, plus a fidelity manifest comparison and homepage smoke test.
+* **WP-CLI**: `wp unboundwp export`, `import`, `verify`, `list`.
 * **No cloud, no accounts, no upsells.**
 
 ## Requirements
@@ -64,8 +65,23 @@ unboundwp/          The actual plugin (this is what ships to WordPress.org)
   includes/         PHP classes (UWP_Archive, UWP_Export, UWP_Import, ...)
   templates/        Admin screens
   assets/           Admin CSS and JS
+tests/              Developer-only test harness (never shipped in the zip)
+  run-tests.php     Pure-logic suite: archive format, SQL parser, URL rewrite
+  e2e-local.php     Real export -> verify -> restore against a Local site
+  upload-e2e.ps1    Browser-equivalent sliced upload + chained restore over HTTP
 .wordpress-org/     WordPress.org directory assets (banners, icons)
 ```
+
+Run the fast suite with any PHP binary:
+
+```powershell
+php tests/run-tests.php
+```
+
+The end-to-end scripts default to a Local by Flywheel site at
+`C:\Users\Achi\Local Sites\thriftywedsites\app\public`; override with the
+`E2E_SITE` environment variable. `tests/php.ini` provides the PHP CLI
+extensions Local's binary needs (mysqli, openssl, curl, ...).
 
 The plugin version is defined in two places, keep them in sync:
 
@@ -81,13 +97,13 @@ entry, which breaks installs on some hosts. Build with Python instead
 From the repo root:
 
 ```powershell
-python -c "import zipfile, pathlib; src=pathlib.Path('unboundwp'); out=pathlib.Path('unboundwp-1.0.1.zip'); dirs=sorted([p for p in src.rglob('*') if p.is_dir()], key=lambda p: p.as_posix()); files=sorted([p for p in src.rglob('*') if p.is_file() and p.name not in ('.DS_Store','Thumbs.db','Desktop.ini') and '__pycache__' not in p.parts], key=lambda p: p.as_posix()); z=zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED); z.writestr('unboundwp/',''); [z.writestr(d.as_posix()+'/','') for d in dirs]; [z.write(f,f.as_posix()) for f in files]; z.close()"
+python -c "import zipfile, pathlib; src=pathlib.Path('unboundwp'); out=pathlib.Path('unboundwp-1.1.2.zip'); dirs=sorted([p for p in src.rglob('*') if p.is_dir()], key=lambda p: p.as_posix()); files=sorted([p for p in src.rglob('*') if p.is_file() and p.name not in ('.DS_Store','Thumbs.db','Desktop.ini') and '__pycache__' not in p.parts], key=lambda p: p.as_posix()); z=zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED); z.writestr('unboundwp/',''); [z.writestr(d.as_posix()+'/','') for d in dirs]; [z.write(f,f.as_posix()) for f in files]; z.close()"
 ```
 
 Then verify before uploading to the GitHub release:
 
 ```powershell
-python -c "import zipfile; z=zipfile.ZipFile('unboundwp-1.0.1.zip'); n=z.namelist(); print(len(n),'entries, top-level:',sorted(set(x.split('/')[0] for x in n if '/' in x))); print('explicit unboundwp/:','unboundwp/' in n); print('testzip:',z.testzip())"
+python -c "import zipfile; z=zipfile.ZipFile('unboundwp-1.1.2.zip'); n=z.namelist(); print(len(n),'entries, top-level:',sorted(set(x.split('/')[0] for x in n if '/' in x))); print('explicit unboundwp/:','unboundwp/' in n); print('testzip:',z.testzip())"
 # expect: single top-level `unboundwp`, explicit `unboundwp/` entry, testzip None
 ```
 
@@ -101,7 +117,7 @@ Release zips (`*.zip`) are git ignored. Do not commit them.
 ## Frequently asked questions
 
 **Is there really no size limit?**
-Yes. Browsers upload in 2 MB slices and the server appends them, so PHP upload limits never trigger. Export and import each do a few seconds of work per request and resume, so timeouts cannot stall a run either.
+Yes. Browsers upload in 8 MB slices (halved automatically when a host is stricter) and the server appends them, so PHP upload limits never trigger. Export and import each do a few seconds of work per request and resume, so timeouts cannot stall a run either.
 
 **Can I restore .wpress files?**
 Yes. UnboundWP reads `.wpress` (plain, gzip, and password protected) and writes `.uwp` files that any `.wpress` reader understands.

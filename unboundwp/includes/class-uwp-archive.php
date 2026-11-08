@@ -66,14 +66,28 @@ class UWP_Archive {
 	/**
 	 * Open an existing archive for appending (resume an interrupted export).
 	 *
+	 * Opened read+write (NOT "ab"): append mode forces every write to the
+	 * end of the file, which makes the header backpatching used for
+	 * checksums and encryption impossible. We seek to the end explicitly
+	 * instead, and every writer does the same after patching.
+	 *
 	 * @param string $path Absolute archive path.
 	 * @return resource File handle positioned at end.
 	 * @throws Exception When the file cannot be opened.
 	 */
 	public static function open_for_append( $path ) {
-		$handle = @fopen( $path, 'ab' ); // phpcs:ignore
+		$handle = @fopen( $path, 'c+b' ); // phpcs:ignore
+		if ( false === $handle ) {
+			// Some exotic stream wrappers refuse 'c'; "r+b" still works
+			// for an existing file (which is always the case on resume).
+			$handle = @fopen( $path, 'r+b' ); // phpcs:ignore
+		}
 		if ( false === $handle ) {
 			throw new Exception( sprintf( __( 'Cannot open archive for appending: %s', 'unboundwp' ), $path ) );
+		}
+		if ( 0 !== fseek( $handle, 0, SEEK_END ) ) {
+			fclose( $handle );
+			throw new Exception( sprintf( __( 'Cannot seek in archive: %s', 'unboundwp' ), $path ) );
 		}
 		return $handle;
 	}
@@ -114,6 +128,9 @@ class UWP_Archive {
 	 * @throws Exception On unreadable source or write failure.
 	 */
 	public static function append_file( $archive, $disk_path, $arc_prefix, $arc_name = '', $password = null ) {
+		// Long Linux-style paths need the Windows extended-length prefix
+		// (the staging/source tree can exceed MAX_PATH).
+		$disk_path = UWP_Helpers::win_path( $disk_path );
 		// Regular files only: opening a FIFO/socket/device for reading
 		// blocks forever waiting for a writer that never comes.
 		if ( ! UWP_Helpers::is_regular_file( $disk_path ) || ! is_readable( $disk_path ) ) {
@@ -133,38 +150,154 @@ class UWP_Archive {
 	}
 
 	/**
-	 * Append one file unencrypted (original path, unchanged behavior).
+	 * Append one file unencrypted: ONE streaming pass, no double read.
 	 *
-	 * @param resource $archive Open binary handle (append mode).
+	 * The old writer read every file twice (once for CRC, once for bytes),
+	 * which doubled export time on multi-GB sites. Now the header is
+	 * written first with an empty checksum slot, the bytes are streamed
+	 * while hashing, and the checksum is backpatched in place. When the
+	 * destination is not seekable the entry simply keeps an empty
+	 * checksum (still a valid legacy entry) instead of failing - and the
+	 * write position is restored explicitly so later entries can never
+	 * overwrite data.
+	 *
+	 * @param resource $archive Open binary handle (read/write, at end).
 	 * @param string   $disk_path Absolute source path.
 	 * @param string   $arc_prefix Directory inside the archive.
 	 * @param string   $arc_name Basename inside the archive.
+	 * @throws Exception On unreadable source or write failure.
 	 */
 	protected static function append_file_plain( $archive, $disk_path, $arc_prefix, $arc_name ) {
-		$size  = filesize( $disk_path );
-		$mtime = filemtime( $disk_path );
+		clearstatcache( true, $disk_path );
+		$size  = (int) filesize( $disk_path );
+		$mtime = (int) filemtime( $disk_path );
 
-		// First pass: CRC32 of the source (streamed, low memory).
-		$crc  = self::crc32_file( $disk_path );
-		$head = self::build_header( $arc_name, $size, $mtime, $arc_prefix, $crc );
-		self::fwrite_all( $archive, $head );
+		$start = @ftell( $archive ); // phpcs:ignore
+		if ( false === $start ) {
+			self::append_file_two_pass( $archive, $disk_path, $arc_prefix, $arc_name );
+			return;
+		}
 
-		// Second pass: stream the bytes.
+		// Header first, checksum slot empty, backpatched after streaming.
+		self::fwrite_all( $archive, self::build_header( $arc_name, $size, $mtime, $arc_prefix, '' ) );
+
+		try {
+			$crc = self::stream_into_archive( $archive, $disk_path, $size );
+
+			// A file that changed size mid-copy can still be stored
+			// consistently: patch the header to the bytes actually read.
+			// Throwing AFTER the patch is safe (archive stays aligned) and
+			// lets the export count this one file as skipped.
+			$actual = ftell( $archive ); // phpcs:ignore
+			$written = ( false === $actual ) ? $size : $actual - $start - self::HEADER_SIZE;
+			if ( $written !== $size ) {
+				if ( 0 === @fseek( $archive, $start + 255, SEEK_SET ) ) { // phpcs:ignore
+					self::fwrite_all( $archive, str_pad( (string) (int) $written, self::SIZE_SIZE, "\0" ) );
+				}
+				if ( 0 === @fseek( $archive, $start + 255 + 14 + 12 + 4088, SEEK_SET ) ) { // phpcs:ignore
+					self::fwrite_all( $archive, str_pad( $crc, self::CRC_SIZE, "\0" ) );
+				}
+				if ( 0 !== @fseek( $archive, $start + self::HEADER_SIZE + (int) $written, SEEK_SET ) ) { // phpcs:ignore
+					throw new UWP_Archive_Corrupt_Exception( __( 'Cannot restore write position in archive (not seekable).', 'unboundwp' ) );
+				}
+				throw new Exception( sprintf( __( 'File changed while backing it up (stored %1$d of %2$d bytes): %3$s', 'unboundwp' ), (int) $written, $size, $disk_path ) );
+			}
+
+			// Patch the checksum into the header.
+			if ( 0 === @fseek( $archive, $start + 255 + 14 + 12 + 4088, SEEK_SET ) ) { // phpcs:ignore
+				self::fwrite_all( $archive, str_pad( $crc, self::CRC_SIZE, "\0" ) );
+				if ( 0 !== @fseek( $archive, $start + self::HEADER_SIZE + $written, SEEK_SET ) ) { // phpcs:ignore
+					throw new UWP_Archive_Corrupt_Exception( __( 'Cannot restore write position in archive (not seekable).', 'unboundwp' ) );
+				}
+			} else {
+				// Could not seek back: the header keeps an empty (legacy)
+				// checksum. Make sure the write pointer is at the end again.
+				if ( 0 !== @fseek( $archive, 0, SEEK_END ) ) { // phpcs:ignore
+					throw new UWP_Archive_Corrupt_Exception( __( 'Cannot restore write position in archive (not seekable).', 'unboundwp' ) );
+				}
+			}
+		} catch ( Exception $e ) {
+			// Roll the archive back to the last known-good boundary. The
+			// partial entry disappears, so the NEXT entry's header can
+			// never be read as data of this one (total archive corruption).
+			if ( ! @ftruncate( $archive, $start ) || 0 !== @fseek( $archive, $start, SEEK_SET ) ) { // phpcs:ignore
+				throw new UWP_Archive_Corrupt_Exception(
+					sprintf( __( 'Archive write failed and could not be rolled back (%s). Restart the export to rebuild it.', 'unboundwp' ), $e->getMessage() )
+				);
+			}
+			throw $e;
+		}
+	}
+
+	/**
+	 * Stream exactly $size bytes from disk into the archive, hashing them.
+	 *
+	 * @param resource $archive Open archive handle.
+	 * @param string   $disk_path Source file.
+	 * @param int      $size Expected byte count.
+	 * @return string Lowercase CRC32 hex of the bytes written.
+	 * @throws Exception On read errors.
+	 */
+	protected static function stream_into_archive( $archive, $disk_path, $size ) {
 		$in = @fopen( $disk_path, 'rb' ); // phpcs:ignore
 		if ( false === $in ) {
 			throw new Exception( sprintf( __( 'Cannot open file: %s', 'unboundwp' ), $disk_path ) );
 		}
-		while ( ! feof( $in ) ) {
+		$ctx     = hash_init( 'crc32b' );
+		$written = 0;
+		while ( $written < $size ) {
+			$want = min( self::CHUNK, $size - $written );
+			$data = fread( $in, $want ); // phpcs:ignore
+			if ( false === $data ) {
+				fclose( $in );
+				throw new Exception( sprintf( __( 'Cannot read file: %s', 'unboundwp' ), $disk_path ) );
+			}
+			if ( '' === $data ) {
+				break; // file shrank mid-copy - caller patches the size.
+			}
+			hash_update( $ctx, $data );
+			self::fwrite_all( $archive, $data );
+			$written += strlen( $data );
+		}
+		fclose( $in );
+		return strtolower( hash_final( $ctx ) );
+	}
+
+	/**
+	 * Legacy two-pass writer, kept for non-seekable destinations.
+	 *
+	 * @param resource $archive Open binary handle (append/write only).
+	 * @param string   $disk_path Absolute source path.
+	 * @param string   $arc_prefix Directory inside the archive.
+	 * @param string   $arc_name Basename inside the archive.
+	 */
+	protected static function append_file_two_pass( $archive, $disk_path, $arc_prefix, $arc_name ) {
+		$size  = filesize( $disk_path );
+		$mtime = filemtime( $disk_path );
+		$crc   = self::crc32_file( $disk_path );
+		self::fwrite_all( $archive, self::build_header( $arc_name, $size, $mtime, $arc_prefix, $crc ) );
+
+		$in = @fopen( $disk_path, 'rb' ); // phpcs:ignore
+		if ( false === $in ) {
+			throw new Exception( sprintf( __( 'Cannot open file: %s', 'unboundwp' ), $disk_path ) );
+		}
+		$written = 0;
+		while ( ! feof( $in ) && $written < $size ) {
 			$data = fread( $in, self::CHUNK ); // phpcs:ignore
 			if ( false === $data ) {
 				fclose( $in );
 				throw new Exception( sprintf( __( 'Cannot read file: %s', 'unboundwp' ), $disk_path ) );
 			}
-			if ( '' !== $data ) {
-				self::fwrite_all( $archive, $data );
+			if ( '' === $data ) {
+				break;
 			}
+			self::fwrite_all( $archive, $data );
+			$written += strlen( $data );
 		}
 		fclose( $in );
+		if ( $written !== (int) $size ) {
+			throw new Exception( sprintf( __( 'File changed while backing it up: %s', 'unboundwp' ), $disk_path ) );
+		}
 	}
 
 	/**
@@ -196,41 +329,52 @@ class UWP_Archive {
 		// Placeholder header (size + CRC backpatched below).
 		self::fwrite_all( $archive, self::build_header( $arc_name, 0, $mtime, $arc_prefix, '' ) );
 
-		$ctx     = hash_init( 'crc32b' );
-		$written = 0;
-		$in      = @fopen( $disk_path, 'rb' ); // phpcs:ignore
-		if ( false === $in ) {
-			throw new Exception( sprintf( __( 'Cannot open file: %s', 'unboundwp' ), $disk_path ) );
-		}
-		while ( ! feof( $in ) ) {
-			$data = fread( $in, self::CHUNK ); // phpcs:ignore
-			if ( false === $data ) {
-				fclose( $in );
-				throw new Exception( sprintf( __( 'Cannot read file: %s', 'unboundwp' ), $disk_path ) );
+		try {
+			$ctx     = hash_init( 'crc32b' );
+			$written = 0;
+			$in      = @fopen( $disk_path, 'rb' ); // phpcs:ignore
+			if ( false === $in ) {
+				throw new Exception( sprintf( __( 'Cannot open file: %s', 'unboundwp' ), $disk_path ) );
 			}
-			if ( '' === $data ) {
-				continue;
+			while ( ! feof( $in ) ) {
+				$data = fread( $in, self::CHUNK ); // phpcs:ignore
+				if ( false === $data ) {
+					fclose( $in );
+					throw new Exception( sprintf( __( 'Cannot read file: %s', 'unboundwp' ), $disk_path ) );
+				}
+				if ( '' === $data ) {
+					continue;
+				}
+				hash_update( $ctx, $data );
+				$enc = self::encrypt_chunk( $data, $password );
+				self::fwrite_all( $archive, $enc );
+				$written += strlen( $enc );
 			}
-			hash_update( $ctx, $data );
-			$enc = self::encrypt_chunk( $data, $password );
-			self::fwrite_all( $archive, $enc );
-			$written += strlen( $enc );
-		}
-		fclose( $in );
-		$crc = strtolower( hash_final( $ctx ) );
+			fclose( $in );
+			$crc = strtolower( hash_final( $ctx ) );
 
-		// Backpatch size (14) then CRC (8): seek over name(255) to size,
-		// write it, skip mtime(12) + prefix(4088), write CRC, return to end.
-		if ( 0 !== @fseek( $archive, $header_start + 255, SEEK_SET ) ) { // phpcs:ignore
-			throw new Exception( __( 'Cannot finalize encrypted backup (destination not seekable).', 'unboundwp' ) );
-		}
-		self::fwrite_all( $archive, str_pad( (string) $written, 14, "\0" ) ); // phpcs:ignore
-		if ( 0 !== @fseek( $archive, $header_start + 255 + 14 + 12 + 4088, SEEK_SET ) ) { // phpcs:ignore
-			throw new Exception( __( 'Cannot finalize encrypted backup (destination not seekable).', 'unboundwp' ) );
-		}
-		self::fwrite_all( $archive, str_pad( $crc, 8, "\0" ) ); // phpcs:ignore
-		if ( 0 !== @fseek( $archive, $header_start + self::HEADER_SIZE + $written, SEEK_SET ) ) { // phpcs:ignore
-			throw new Exception( __( 'Cannot finalize encrypted backup (destination not seekable).', 'unboundwp' ) );
+			// Backpatch size (14) then CRC (8): seek over name(255) to size,
+			// write it, skip mtime(12) + prefix(4088), write CRC, back to end.
+			if ( 0 !== @fseek( $archive, $header_start + 255, SEEK_SET ) ) { // phpcs:ignore
+				throw new UWP_Archive_Corrupt_Exception( __( 'Cannot finalize encrypted backup (destination not seekable).', 'unboundwp' ) );
+			}
+			self::fwrite_all( $archive, str_pad( (string) $written, 14, "\0" ) ); // phpcs:ignore
+			if ( 0 !== @fseek( $archive, $header_start + 255 + 14 + 12 + 4088, SEEK_SET ) ) { // phpcs:ignore
+				throw new UWP_Archive_Corrupt_Exception( __( 'Cannot finalize encrypted backup (destination not seekable).', 'unboundwp' ) );
+			}
+			self::fwrite_all( $archive, str_pad( $crc, 8, "\0" ) ); // phpcs:ignore
+			if ( 0 !== @fseek( $archive, $header_start + self::HEADER_SIZE + $written, SEEK_SET ) ) { // phpcs:ignore
+				throw new UWP_Archive_Corrupt_Exception( __( 'Cannot finalize encrypted backup (destination not seekable).', 'unboundwp' ) );
+			}
+		} catch ( Exception $e ) {
+			// Never leave a half-written encrypted entry behind: a partial
+			// blob would make every following header unreadable.
+			if ( ! @ftruncate( $archive, $header_start ) || 0 !== @fseek( $archive, $header_start, SEEK_SET ) ) { // phpcs:ignore
+				throw new UWP_Archive_Corrupt_Exception(
+					sprintf( __( 'Encrypted backup write failed and could not be rolled back (%s). Restart the export to rebuild it.', 'unboundwp' ), $e->getMessage() )
+				);
+			}
+			throw $e;
 		}
 	}
 
@@ -448,6 +592,7 @@ class UWP_Archive {
 		$password    = isset( $options['password'] ) ? $options['password'] : null;
 		$compression = isset( $options['compression'] ) ? $options['compression'] : null;
 		$is_config   = self::is_config_name( isset( $entry['basename'] ) ? $entry['basename'] : '' );
+		$dest        = UWP_Helpers::win_path( $dest );
 
 		$dir = dirname( $dest );
 		if ( ! file_exists( $dir ) ) {
@@ -871,4 +1016,17 @@ class UWP_Archive {
 		fclose( $in );
 		return strtolower( hash_final( $ctx ) );
 	}
+}
+
+/**
+ * The archive may no longer be structurally trustworthy.
+ *
+ * Thrown when a write failed AND the partial entry could not be rolled
+ * back. Appending anything after that point would make every following
+ * header unreadable, so the job must rebuild the archive instead of
+ * treating it as a skippable file.
+ *
+ * @package UnboundWP
+ */
+class UWP_Archive_Corrupt_Exception extends Exception {
 }

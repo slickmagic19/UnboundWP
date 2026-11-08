@@ -51,7 +51,7 @@
 						// failure. Coerce it - assigning _status to a
 						// number throws under strict mode and used to
 						// trap the runner in an endless retry loop.
-						j = { success: false, data: { message: '' } };
+						j = { success: false, data: { message: '' }, _html: true };
 						// Keep a plain-text snippet: server error pages
 						// (e.g. maintenance 503s) then diagnose themselves.
 						var snippet = t.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 160);
@@ -231,6 +231,12 @@
 				if (isAuthFailure(j)) {
 					stopWithMessage(UWP.i18n.sessionExpired);
 					showResume();
+					return;
+				}
+				// A gateway page (502/503/504) means the PHP worker died or
+				// restarted; job state is on disk, so retry the tick.
+				if (j._html && (j._status >= 500 || j._status === 0)) {
+					transportFail(driveTick);
 					return;
 				}
 				var msg = (j.data && j.data.message) || '';

@@ -12,3 +12,6 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 *.log
+
+# Test harness scratch space
+tests/.tmp/

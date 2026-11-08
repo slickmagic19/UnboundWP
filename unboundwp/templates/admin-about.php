@@ -18,9 +18,11 @@
 		<h2><?php esc_html_e( 'How it stays reliable', 'unboundwp' ); ?></h2>
 		<ul class="uwp-list">
 			<li><?php esc_html_e( 'Files stream in 500 KB chunks, so memory stays flat even for huge media libraries.', 'unboundwp' ); ?></li>
-			<li><?php esc_html_e( 'Database dumps run in small keyed batches, so speed stays steady on huge tables with no max execution time failures.', 'unboundwp' ); ?></li>
-			<li><?php esc_html_e( 'Progress is saved after every step, so refresh and it resumes where it left off.', 'unboundwp' ); ?></li>
-			<li><?php esc_html_e( 'Every file carries a CRC32 checksum, so corruption is detected instead of silently restored.', 'unboundwp' ); ?></li>
+			<li><?php esc_html_e( 'Uploads are sliced into small pieces (8 MB, shrinking automatically), so PHP upload limits and gateway timeouts never cap the backup size.', 'unboundwp' ); ?></li>
+			<li><?php esc_html_e( 'Database dumps run in small keyed batches, and imports stream through a real SQL parser that understands multi-line statements, extended INSERTs and DELIMITER blocks.', 'unboundwp' ); ?></li>
+			<li><?php esc_html_e( 'Progress is saved after every step in an atomically written state file, so refresh and it resumes where it left off.', 'unboundwp' ); ?></li>
+			<li><?php esc_html_e( 'Every file carries a CRC32 checksum. The archive writer verifies each entry and rolls back a failed write instead of producing a corrupt backup.', 'unboundwp' ); ?></li>
+			<li><?php esc_html_e( 'Restores are quarantined: plugins are reactivated one by one, a crashing plugin is left inactive, and a missing theme falls back safely.', 'unboundwp' ); ?></li>
 		</ul>
 	</div>
 

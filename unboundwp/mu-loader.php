@@ -48,9 +48,19 @@ if ( ! function_exists( 'uwp_mu_log_fatal' ) ) {
 		if ( is_array( $files ) ) {
 			$bits = array();
 			foreach ( array_slice( $files, 0, 3 ) as $sf ) {
+				// Only a job that is still running can own this fatal: a
+				// finished (or long-abandoned) job's state must never pin
+				// a crash onto the next restore.
+				$mt = (int) @filemtime( $sf ); // phpcs:ignore
+				if ( $mt > 0 && $mt < time() - 900 ) {
+					continue;
+				}
 				$raw = @file_get_contents( $sf ); // phpcs:ignore
 				$st  = $raw ? json_decode( $raw, true ) : null;
 				if ( ! is_array( $st ) ) {
+					continue;
+				}
+				if ( ! empty( $st['done'] ) ) {
 					continue;
 				}
 				$step = isset( $st['step'] ) ? $st['step'] : '?';
@@ -118,7 +128,7 @@ if ( ! function_exists( 'uwp_temp_dir' ) ) {
 // is what caused the historical "Cannot redeclare uwp_backups_dir()"
 // bootstrap fatals - the self-healer keys on file hash, this is the belt.
 if ( ! defined( 'UWP_MU_LOADER_VERSION' ) ) {
-	define( 'UWP_MU_LOADER_VERSION', '1.0.1' );
+	define( 'UWP_MU_LOADER_VERSION', '1.1.2' );
 }
 // NOTE: no uwp_ensure_directories() stub here on purpose - with both sides
 // guarded, the first definition wins, and the no-op would shadow the real

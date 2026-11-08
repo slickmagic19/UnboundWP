@@ -49,7 +49,7 @@
 						// failure. Coerce it - assigning _status to a
 						// number throws under strict mode and used to
 						// trap the runner in an endless retry loop.
-						j = { success: false, data: { message: '' } };
+						j = { success: false, data: { message: '' }, _html: true };
 						// Keep a plain-text snippet: server error pages
 						// (e.g. maintenance 503s) then diagnose themselves.
 						var snippet = t.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 160);
@@ -88,15 +88,43 @@
 	}
 
 	function uploadFile(file) {
-		var chunkSize = UWP.chunkSize || (2 * 1024 * 1024);
+		var maxChunk = 8 * 1024 * 1024;
+		var chunkSize = Math.min(UWP.chunkSize || maxChunk, maxChunk);
 		var minChunk = 256 * 1024;
-		var maxFails = 10;
+		var maxFails = 24;
 		var sent = 0;   // bytes the server has confirmed (always obeyed)
 		var fails = 0;  // consecutive failures for the current position
 		setUpload(0, UWP.i18n.uploading);
 
 		function failFatal(msg) {
 			upStatus.textContent = msg || UWP.i18n.failed;
+		}
+
+		// Resend the same offset after a hiccup. The merge protocol is
+		// idempotent, so a slice that actually landed is detected as a
+		// duplicate and skipped instead of corrupting the file.
+		function retry(msg) {
+			fails++;
+			if (fails > maxFails) {
+				failFatal(msg || UWP.i18n.failed);
+				return;
+			}
+			upStatus.textContent = (msg || UWP.i18n.retrying || 'Retrying…') + ' (' + fails + '/' + maxFails + ')';
+			setTimeout(sendSlice, Math.min(15000, 700 * fails));
+		}
+
+		// The host refused this piece size (nginx 413, or PHP discarded the
+		// body because post_max_size is smaller). Halve and resend from the
+		// server's confirmed byte count.
+		function shrink(msg) {
+			if (chunkSize <= minChunk) {
+				failFatal(msg || UWP.i18n.failed);
+				return;
+			}
+			chunkSize = Math.max(minChunk, Math.floor(chunkSize / 2));
+			fails = 0;
+			upStatus.textContent = (msg || UWP.i18n.retrying || 'Retrying…');
+			setTimeout(sendSlice, 400);
 		}
 
 		function sendSlice() {
@@ -113,18 +141,27 @@
 						failFatal(UWP.i18n.sessionExpired);
 						return;
 					}
-					// Server asks for smaller pieces (strict host limits).
-					if (info.shrink && chunkSize > minChunk) {
-						chunkSize = Math.max(minChunk, Math.floor(chunkSize / 2));
-						fails = 0;
-						setTimeout(sendSlice, 500);
+					// nginx rejected the body size.
+					if (j._status === 413) {
+						shrink(info.message);
 						return;
 					}
-					// Transient server hiccup - resend the same bytes.
-					if (info.retryable && fails < maxFails) {
-						fails++;
-						upStatus.textContent = (info.message || UWP.i18n.failed) + ' ' + (UWP.i18n.retrying || 'Retrying…');
-						setTimeout(sendSlice, Math.min(15000, 1000 * fails));
+					// No JSON at all: either a 5xx gateway page (PHP worker
+					// recycled; Local/WP-CLI-style PHP restarts, the classic
+					// 502 after a few hundred requests) or a 200 with a bare
+					// `0` (PHP discarded an oversized body). Retry the same
+					// bytes for gateway errors; shrink for discarded bodies.
+					if (j._html) {
+						if (j._status >= 500 || j._status === 0) {
+							retry(info.message);
+						} else {
+							shrink(info.message);
+						}
+						return;
+					}
+					// Server asks for smaller pieces (strict host limits).
+					if (info.shrink) {
+						shrink(info.message);
 						return;
 					}
 					// Asked to restart from scratch (out-of-sync guard).
@@ -132,6 +169,11 @@
 						sent = 0;
 						fails = 0;
 						setTimeout(sendSlice, 500);
+						return;
+					}
+					// Transient server hiccup - resend the same bytes.
+					if (info.retryable) {
+						retry(info.message);
 						return;
 					}
 					failFatal(info.message);
@@ -157,21 +199,42 @@
 				// Network-level failure (timeout, dropped connection):
 				// the server may or may not have landed this slice, but the
 				// offset protocol makes resending safe either way.
-				fails++;
-				if (fails > maxFails) {
-					failFatal(UWP.i18n.failed);
-					return;
-				}
-				// After a few network failures, assume a strict host and
-				// shrink the pieces before continuing.
 				if (fails === 4 && chunkSize > minChunk) {
 					chunkSize = Math.max(minChunk, Math.floor(chunkSize / 2));
 				}
-				upStatus.textContent = (UWP.i18n.retrying || 'Retrying…') + ' (' + fails + '/' + maxFails + ')';
-				setTimeout(sendSlice, Math.min(15000, 1000 * fails));
+				retry(UWP.i18n.retrying || 'Retrying…');
 			});
 		}
-		sendSlice();
+
+		// Resume a previous attempt instead of restarting from zero: after a
+		// 502, a reload or a browser restart the server may already hold
+		// most of a multi-hundred-MB file.
+		post('uwp_upload_status', {
+			file_name: file.name,
+			total_size: String(file.size)
+		}).then(function (j) {
+			if (!j.success || !j.data) {
+				return false;
+			}
+			var received = (typeof j.data.received === 'number') ? j.data.received : 0;
+			if (received === file.size && j.data.archive_ok) {
+				// Exactly this file already landed completely.
+				setUpload(100, UWP.i18n.uploaded || 'Upload complete.');
+				startImport(file.name);
+				return true;
+			}
+			if (received > 0 && received < file.size) {
+				sent = received;
+				setUpload(Math.round(100 * sent / file.size), UWP.i18n.resuming || 'Resuming…');
+			}
+			return false;
+		}).catch(function () {
+			return false;
+		}).then(function (finished) {
+			if (!finished) {
+				sendSlice();
+			}
+		});
 	}
 
 	function importTick() {
@@ -323,7 +386,14 @@
 			return;
 		}
 		var delay = (transportFails === 1) ? 300 : Math.min(30000, 2000 * transportFails);
-		impStatus.textContent = (UWP.i18n.retrying || 'Retrying…') + ' (' + transportFails + '/' + maxTransportFails + '). Safe to leave this tab open.';
+		var msg = (UWP.i18n.retrying || 'Retrying…') + ' (' + transportFails + '/' + maxTransportFails + '). Safe to leave this tab open.';
+		if (transportFails === 12) {
+			// Sustained failures mean the site itself may be down (a plugin
+			// the restore activated can crash every request): repeating the
+			// tick cannot succeed until that is fixed.
+			msg = UWP.i18n.siteDown || msg;
+		}
+		impStatus.textContent = msg;
 		setTimeout(op, delay);
 	}
 
@@ -373,6 +443,13 @@
 					stopForResume(UWP.i18n.sessionExpired);
 					return;
 				}
+				// A gateway page (502/503/504) means the PHP worker died or
+				// restarted - the job state is safe on disk, so simply retry
+				// the tick instead of stopping the operator.
+				if (j._html && (j._status >= 500 || j._status === 0)) {
+					transportFail(driveTick);
+					return;
+				}
 				var msg = (j.data && j.data.message) || '';
 				if (!msg && j._status >= 500) {
 					msg = UWP.i18n.serverError + ' (HTTP ' + j._status + ')';
@@ -414,6 +491,8 @@
 					stopForResume(UWP.i18n.sessionExpired);
 					return;
 				}
+				// Status polling is read-only: any error (incl. a 502 from a
+				// recycled PHP worker) is just retried.
 				transportFail(pollStatus);
 				return;
 			}
@@ -462,11 +541,13 @@
 		setImport(0, UWP.i18n.starting);
 		var keepCore = document.getElementById('uwp-opt-keep-core');
 		var noPlugins = document.getElementById('uwp-opt-no-plugins');
+		var skipReplace = document.getElementById('uwp-opt-skip-replace');
 		post('uwp_import_start', {
 			archive: fileName,
 			password: passInput ? passInput.value : '',
 			keep_core: (keepCore && keepCore.checked) ? '1' : '',
-			skip_plugins: (noPlugins && noPlugins.checked) ? '1' : ''
+			skip_plugins: (noPlugins && noPlugins.checked) ? '1' : '',
+			skip_replace: (skipReplace && skipReplace.checked) ? '1' : ''
 		}).then(function (j) {
 			if (!j.success) {
 				importing = false;
@@ -595,9 +676,13 @@
 
 	// On page load: if a job is active (e.g. still running server-side via
 	// loopback chaining from another tab), show the resume banner and watch
-	// it - polling takes over driving automatically if it stalls.
+	// it - polling takes over driving automatically if it stalls. When the
+	// Backups page sent us here with a chosen file, start that restore once
+	// we know nothing else is running.
 	post('uwp_job_status', { job: 'import' }).then(function (j) {
+		var busy = false;
 		if (j.success && j.data && j.data.active) {
+			busy = true;
 			keepNonce(j.data);
 			if (j.data.secret) {
 				UWP.jobSecret = j.data.secret;
@@ -606,11 +691,19 @@
 			transportFails = 0;
 			lastPct = -1;
 			lastAdvance = Date.now();
-		setImport(j.data.percent || 0, j.data.message || '');
-		showResume(resumeInfoText(j.data));
-		pollStatus();
+			setImport(j.data.percent || 0, j.data.message || '');
+			showResume(resumeInfoText(j.data));
+			pollStatus();
 		} else if (j.success && j.data && j.data.done) {
 			finishImport(j.data.message);
+		}
+		if (!busy && UWP.autoRestore && typeof UWP.autoRestore === 'string') {
+			// The Backups page already asked for confirmation; ask once more
+			// so a crafted link can never silently wipe a site.
+			if (confirm(UWP.i18n.confirm)) {
+				impBox.scrollIntoView({ behavior: 'smooth' });
+				startImport(UWP.autoRestore);
+			}
 		}
 	}).catch(function () { /* status check is best-effort only */ });
 })();

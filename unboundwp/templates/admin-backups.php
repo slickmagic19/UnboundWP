@@ -81,7 +81,7 @@
 		var res = e.target.closest ? e.target.closest('.uwp-restore') : null;
 		if (res) {
 			if (!confirm(<?php echo wp_json_encode( __( 'This will overwrite your site with the backup. Continue?', 'unboundwp' ) ); ?>)) return;
-			window.location.href = <?php echo wp_json_encode( admin_url( 'admin.php?page=unboundwp-import' ) ); ?>;
+			window.location.href = <?php echo wp_json_encode( admin_url( 'admin.php?page=unboundwp-import' ) ); ?> + '&restore=' + encodeURIComponent(res.getAttribute('data-file'));
 		}
 		var ver = e.target.closest ? e.target.closest('.uwp-verify') : null;
 		if (ver) {

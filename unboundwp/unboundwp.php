@@ -3,7 +3,7 @@
  * Plugin Name:       UnboundWP - Free Migration & Backup
  * Plugin URI:        https://github.com/slickmagic19/UnboundWP
  * Description:       Free and open-source site export, import, backup and 1-click restore. No size limits, no paywalls. Reads and writes .uwp files (fully .wpress compatible).
- * Version:           1.0.1
+ * Version:           1.1.2
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            UnboundWP Contributors
@@ -29,7 +29,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // strict error display, corrupts ajax JSON responses).
 // ---------------------------------------------------------------------------
 
-defined( 'UWP_VERSION' ) || define( 'UWP_VERSION', '1.0.1' );
+defined( 'UWP_VERSION' ) || define( 'UWP_VERSION', '1.1.2' );
 defined( 'UWP_PLUGIN_FILE' ) || define( 'UWP_PLUGIN_FILE', __FILE__ );
 defined( 'UWP_PLUGIN_DIR' ) || define( 'UWP_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 defined( 'UWP_PLUGIN_URL' ) || define( 'UWP_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -42,7 +42,7 @@ defined( 'UWP_WPRESS_EXTENSION' ) || define( 'UWP_WPRESS_EXTENSION', 'wpress' );
 defined( 'UWP_HEADER_SIZE' ) || define( 'UWP_HEADER_SIZE', 4377 );
 defined( 'UWP_CHUNK_BYTES' ) || define( 'UWP_CHUNK_BYTES', 512000 ); // 500 KB streaming chunks (never load whole files).
 defined( 'UWP_AJAX_TIME_BUDGET' ) || define( 'UWP_AJAX_TIME_BUDGET', 8 ); // seconds of work per AJAX tick (timeout-safe).
-defined( 'UWP_UPLOAD_CHUNK' ) || define( 'UWP_UPLOAD_CHUNK', 2097152 ); // 2 MB browser upload slices (no size limit).
+defined( 'UWP_UPLOAD_CHUNK' ) || define( 'UWP_UPLOAD_CHUNK', 8388608 ); // 8 MB browser upload slices; the client halves them automatically on strict hosts. Fewer requests = far less chance of hitting a FastCGI worker recycle (the classic 502).
 
 // ---------------------------------------------------------------------------
 // Includes (small, single-purpose, human-readable classes)
@@ -140,12 +140,23 @@ if ( ! function_exists( 'uwp_ensure_directories' ) ) {
 			// job secrets are long random tokens and never appear in URLs.
 			file_put_contents( $dir . '.htaccess', "Require all denied\n" ); // phpcs:ignore
 		}
-		// Clean up a stale maintenance marker from older versions (which
-		// wrongly created one and 503'd the site, including admin-ajax).
 		if ( class_exists( 'UWP_Helpers' ) ) {
+			// Cheap on every request: drop a stale maintenance marker from
+			// older versions (which wrongly created one and 503'd the site).
 			UWP_Helpers::maintenance_sweep();
-			// Grind through trashed work dirs a few seconds at a time.
-			UWP_Helpers::empty_trash( 3 );
+			// Expensive housekeeping (grinding trash, pruning abandoned
+			// work) only where a few extra seconds are acceptable. Running
+			// it on front-end requests punished every page view.
+			if ( UWP_Helpers::is_job_context() ) {
+				UWP_Helpers::empty_trash( 2 );
+				// Throttled: at most once an hour, tracked in a tiny file.
+				$stamp = trailingslashit( uwp_temp_dir() ) . 'sweep.stamp';
+				$last  = is_file( $stamp ) ? (int) file_get_contents( $stamp ) : 0; // phpcs:ignore
+				if ( ( time() - $last ) > 3600 ) {
+					@file_put_contents( $stamp, (string) time() ); // phpcs:ignore
+					UWP_Helpers::prune_temp_orphans();
+				}
+			}
 		}
 	}
 }

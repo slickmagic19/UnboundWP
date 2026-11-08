@@ -94,6 +94,22 @@ class UWP_Admin {
 	}
 
 	/**
+	 * Sanitized `restore` query arg (set by the Backups page).
+	 *
+	 * @return string Backup file name, or '' when none/invalid.
+	 */
+	protected static function requested_restore() {
+		if ( ! isset( $_GET['restore'] ) ) { // phpcs:ignore
+			return '';
+		}
+		$name = sanitize_file_name( wp_unslash( $_GET['restore'] ) ); // phpcs:ignore
+		if ( '' === $name || ! UWP_Helpers::is_supported_archive( $name ) ) {
+			return '';
+		}
+		return is_file( trailingslashit( uwp_backups_dir() ) . $name ) ? $name : '';
+	}
+
+	/**
 	 * Tab navigation shared by every UnboundWP page.
 	 *
 	 * @param string $current Active tab slug: export, import, backups, logs, about.
@@ -138,7 +154,10 @@ class UWP_Admin {
 			'uwp-admin',
 			UWP_PLUGIN_URL . 'assets/css/admin.css',
 			array(),
-			UWP_VERSION
+			// File date on top of the version: an upgraded plugin whose
+			// version string did not change (or a browser holding the old
+			// file) still gets the new CSS/JS immediately.
+			UWP_VERSION . '.' . (int) @filemtime( UWP_PLUGIN_DIR . 'assets/css/admin.css' ) // phpcs:ignore
 		);
 
 		$data = array(
@@ -147,11 +166,16 @@ class UWP_Admin {
 			'chunkSize' => UWP_UPLOAD_CHUNK,
 			'homeUrl'   => home_url( '/' ),
 			'logsUrl'   => admin_url( 'admin.php?page=unboundwp-logs' ),
+			// 1-click restore from the Backups page lands here with the
+			// chosen file; the runner starts it once the page is ready.
+			'autoRestore' => self::requested_restore(),
 			'i18n'      => array(
 				'starting'       => __( 'Starting…', 'unboundwp' ),
 				'resuming'       => __( 'Resuming…', 'unboundwp' ),
 				'uploading'      => __( 'Uploading…', 'unboundwp' ),
+				'uploaded'       => __( 'Upload complete.', 'unboundwp' ),
 				'retrying'       => __( 'Retrying…', 'unboundwp' ),
+				'siteDown'       => __( 'The site is not responding. If this keeps failing, open the site or wp-admin in a new tab: a plugin the restore activated may be crashing every request.', 'unboundwp' ),
 				'failed'         => __( 'Something went wrong. Please try again.', 'unboundwp' ),
 				'gaveUp'         => __( 'Still no response from the server. Your progress is saved, so use Resume to keep trying. If this repeats, the server log (unboundwp-temp/uwp-debug.log in uploads) names the failing step.', 'unboundwp' ),
 				'serverError'    => __( 'The server errored during this step. Your progress is saved, so use Resume to keep trying.', 'unboundwp' ),
@@ -167,10 +191,10 @@ class UWP_Admin {
 
 		$screen = get_current_screen();
 		if ( $screen && false !== strpos( $screen->id, 'unboundwp-import' ) ) {
-			wp_enqueue_script( 'uwp-import', UWP_PLUGIN_URL . 'assets/js/import.js', array(), UWP_VERSION, true );
+			wp_enqueue_script( 'uwp-import', UWP_PLUGIN_URL . 'assets/js/import.js', array(), UWP_VERSION . '.' . (int) @filemtime( UWP_PLUGIN_DIR . 'assets/js/import.js' ), true ); // phpcs:ignore
 			wp_localize_script( 'uwp-import', 'UWP', $data );
 		} else {
-			wp_enqueue_script( 'uwp-export', UWP_PLUGIN_URL . 'assets/js/export.js', array(), UWP_VERSION, true );
+			wp_enqueue_script( 'uwp-export', UWP_PLUGIN_URL . 'assets/js/export.js', array(), UWP_VERSION . '.' . (int) @filemtime( UWP_PLUGIN_DIR . 'assets/js/export.js' ), true ); // phpcs:ignore
 			wp_localize_script( 'uwp-export', 'UWP', $data );
 		}
 	}

@@ -13,7 +13,7 @@
  *   8. finalize  - theme fallback, flush caches, cleanup
  *
  * Timeouts are impossible by construction: no tick does more than
- * ~8 seconds of work, uploads arrive in 2 MB slices, and every step
+ * ~8 seconds of work, uploads arrive in auto-shrinking slices, and every step
  * persists its offset so it can resume after any interruption.
  *
  * @package UnboundWP
@@ -47,6 +47,8 @@ class UWP_Import {
 		if ( ! UWP_Helpers::is_supported_archive( $archive_path ) ) {
 			throw new Exception( __( 'Only .uwp and .wpress files can be imported.', 'unboundwp' ) );
 		}
+		// Clear abandoned work, but never the archive we are about to use.
+		UWP_Helpers::prune_temp_orphans( 604800, array( $archive_path ) );
 
 		$job_id   = 'import-' . gmdate( 'Ymd-His' ) . '-' . substr( wp_generate_password( 8, false, false ), 0, 6 );
 		$work_dir = trailingslashit( uwp_temp_dir() ) . $job_id . '/';
@@ -79,9 +81,17 @@ class UWP_Import {
 			'live'         => array(),
 			'pairs'        => array(),
 			'replace_state' => array(),
-			// Files.
-			'copy_list'    => array(),
+			// Files. The actual lists live on DISK (copylist.tsv /
+			// corelist.tsv); only counters and byte offsets are kept here,
+			// so the state file stays a few KB even for 100k+ files.
+			'copy_file'    => $work_dir . 'copylist.tsv',
+			'core_file'    => $work_dir . 'corelist.tsv',
+			'copy_total'   => 0,
+			'core_total'   => 0,
+			'copy_offset'  => 0,
+			'core_offset'  => 0,
 			'copy_index'   => 0,
+			'core_index'   => 0,
 			// Login session snapshot (restored after the DB import so the
 			// restore doesn't log you out mid-run - see snapshot_session()).
 			'session'      => null,
@@ -91,9 +101,16 @@ class UWP_Import {
 			// full restore; persisted so resume honors the same choices).
 			'keep_core'    => ! empty( $options['keep_core'] ),
 			'skip_plugins' => ! empty( $options['skip_plugins'] ),
+			'skip_replace' => ! empty( $options['skip_replace'] ),
 		);
 		self::snapshot_session( $state );
+		// Secret lives in its own guarded file, never in the state JSON
+		// (which would be readable on hosts that ignore .htaccess).
+		$secret = $state['secret'];
+		unset( $state['secret'] );
 		self::save( $state );
+		UWP_Helpers::job_write_secret( self::STATE_OPTION, $secret );
+		$state['secret'] = $secret; // return value only - not persisted.
 		UWP_Helpers::job_clear_done( self::STATE_OPTION ); // no stale completion.
 		UWP_Helpers::maintenance_sweep(); // clear any pre-1.0.9 marker.
 		if ( function_exists( 'delete_option' ) ) {
@@ -104,7 +121,7 @@ class UWP_Import {
 		}
 		UWP_Helpers::debug_log(
 			sprintf(
-				'import started: job %s, archive %s (%d bytes), session %s',
+				'import %s: started, archive %s (%d bytes), session %s',
 				$job_id,
 				basename( $archive_path ),
 				filesize( $archive_path ),
@@ -125,9 +142,13 @@ class UWP_Import {
 	public static function restore_options_from_request() {
 		$keep = isset( $_POST['keep_core'] ) ? (string) wp_unslash( $_POST['keep_core'] ) : ''; // phpcs:ignore
 		$skip = isset( $_POST['skip_plugins'] ) ? (string) wp_unslash( $_POST['skip_plugins'] ) : ''; // phpcs:ignore
+		$same = isset( $_POST['skip_replace'] ) ? (string) wp_unslash( $_POST['skip_replace'] ) : ''; // phpcs:ignore
 		return array(
 			'keep_core'    => '1' === $keep,
 			'skip_plugins' => '1' === $skip,
+			// Same-domain restores: keep the backup's own URLs instead of
+			// rewriting them to this install's (Ai1WM offers the same).
+			'skip_replace' => '1' === $same,
 		);
 	}
 
@@ -203,9 +224,9 @@ class UWP_Import {
 				$msg = __( 'Cataloguing files…', 'unboundwp' );
 				break;
 			case 'files':
-				$total = isset( $state['copy_list'] ) && is_array( $state['copy_list'] ) ? UWP_Helpers::safe_count( $state['copy_list'] ) : 0;
-				$done  = isset( $state['copy_index'] ) ? (int) $state['copy_index'] : 0;
-				$ctotal = isset( $state['core_list'] ) && is_array( $state['core_list'] ) ? UWP_Helpers::safe_count( $state['core_list'] ) : 0;
+				$total  = isset( $state['copy_total'] ) ? (int) $state['copy_total'] : 0;
+				$done   = isset( $state['copy_index'] ) ? (int) $state['copy_index'] : 0;
+				$ctotal = isset( $state['core_total'] ) ? (int) $state['core_total'] : 0;
 				$cdone  = isset( $state['core_index'] ) ? (int) $state['core_index'] : 0;
 				$all    = $total + $ctotal;
 				$units  = $done + $cdone;
@@ -333,9 +354,7 @@ class UWP_Import {
 		}
 
 		if ( empty( $result['done'] ) ) {
-			$state            = self::load();
-			$secret           = ( is_array( $state ) && isset( $state['secret'] ) ) ? (string) $state['secret'] : '';
-			$result['chained'] = UWP_Helpers::chain_self( 'uwp_import_tick', $secret );
+			$result['chained'] = UWP_Helpers::chain_self( 'uwp_import_tick', UWP_Helpers::job_get_secret( self::STATE_OPTION ) );
 		}
 		return $result;
 	}
@@ -371,7 +390,7 @@ class UWP_Import {
 		if ( null === $state ) {
 			throw new Exception( __( 'No import in progress.', 'unboundwp' ) );
 		}
-		$pinned = UWP_Helpers::job_take_fatal( self::STATE_OPTION );
+		$pinned = UWP_Helpers::job_take_fatal( self::STATE_OPTION, isset( $state['created'] ) ? (int) $state['created'] : 0 );
 		if ( null !== $pinned ) {
 			// A previous tick died hard (pinned by the shutdown handler).
 			// If it died mid-plugin-activation, attribute the crash to that
@@ -430,6 +449,21 @@ class UWP_Import {
 
 		// --- Step 2: extract (streamed, resumable by byte offset) ------------
 		if ( 'extract' === $state['step'] ) {
+			// Disk guard BEFORE unpacking: extraction doubles the space the
+			// site needs (archive + staged copy) and running out halfway
+			// leaves a confusing half-restore. Resumable after freeing space.
+			if ( empty( $state['extract_guard'] ) ) {
+				$need = max( 104857600, (int) $state['total_bytes'] );
+				if ( ! empty( $state['package']['Compression']['Enabled'] ) ) {
+					$need = (int) $need * 3; // decoded size of a compressed entry.
+				}
+				$free = UWP_Helpers::disk_free_bytes( uwp_temp_dir() );
+				if ( false !== $free && $free < $need ) {
+					throw new Exception( sprintf( __( 'Not enough free disk space to unpack this backup: %s free, about %s needed. Free some space and Resume.', 'unboundwp' ), size_format( $free ), size_format( $need ) ) );
+				}
+				$state['extract_guard'] = true;
+				self::save( $state );
+			}
 			$done = self::extract_tick( $state, $started );
 			self::save( $state );
 			$pct = $state['total_bytes'] > 0 ? (int) ( 8 + 40 * min( 1, $state['extract_offset'] / max( 1, $state['total_bytes'] + $state['file_count'] * UWP_Archive::HEADER_SIZE ) ) ) : 20;
@@ -509,6 +543,33 @@ class UWP_Import {
 					wp_cache_flush();
 				}
 				$kept = self::restore_session( $state );
+				// Surface database-level findings: silently missing tables
+				// (e.g. a foreign server's unsupported collation) are how a
+				// "successful" restore ends up with a broken plugin.
+				if ( ! empty( $state['db_state']['collation_fixes'] ) ) {
+					self::core_note(
+						$state,
+						sprintf(
+							/* translators: %d = number of clauses */
+							__( 'Adjusted %d charset/collation clause(s) that this database server does not support (closest supported collation used).', 'unboundwp' ),
+							(int) $state['db_state']['collation_fixes']
+						)
+					);
+				}
+				if ( ! empty( $state['db_state']['db_error_count'] ) ) {
+					$samples = ( isset( $state['db_state']['db_errors'] ) && is_array( $state['db_state']['db_errors'] ) )
+						? array_slice( $state['db_state']['db_errors'], 0, 2 )
+						: array();
+					self::core_note(
+						$state,
+						sprintf(
+							/* translators: 1: count, 2: sample errors */
+							__( '%1$d database statement(s) failed during import%2$s. Check the full log; some rows may be missing.', 'unboundwp' ),
+							(int) $state['db_state']['db_error_count'],
+							! empty( $samples ) ? ' (e.g. ' . implode( ' | ', $samples ) . ')' : ''
+						)
+					);
+				}
 				UWP_Helpers::debug_log(
 					sprintf(
 						'import %s: database done (%d bytes SQL), session %s',
@@ -533,6 +594,13 @@ class UWP_Import {
 				// Build the full old→new replacement list now: backup URLs
 				// and paths from package.json, live values snapshotted
 				// before the import (the live options are already gone).
+				if ( ! empty( $state['skip_replace'] ) ) {
+					$state['pairs'] = array();
+					$state['step']  = 'files_scan';
+					self::save( $state );
+					UWP_Helpers::debug_log( sprintf( 'import %s: URL replacement skipped by option', $state['job_id'] ) );
+					return self::progress( $state, __( 'Database imported. Keeping the backup’s original URLs…', 'unboundwp' ), 76 );
+				}
 				$state['pairs'] = self::build_pairs( $state );
 				if ( ! is_array( $state['pairs'] ) ) {
 					$state['pairs'] = array();
@@ -580,9 +648,15 @@ class UWP_Import {
 			$tables = isset( $state['replace_state']['tables'] ) && is_array( $state['replace_state']['tables'] ) ? UWP_Helpers::safe_count( $state['replace_state']['tables'] ) : 1;
 			$idx    = isset( $state['replace_state']['table_index'] ) ? (int) $state['replace_state']['table_index'] : 0;
 			if ( $idx >= $tables ) {
-				$state['step']       = 'files_scan';
-				$state['copy_list']  = array();
-				$state['copy_index'] = 0;
+				$state['step']        = 'files_scan';
+				$state['copy_list']   = array(); // legacy bridge only.
+				$state['core_list']   = array();
+				$state['copy_total']  = 0;
+				$state['core_total']  = 0;
+				$state['copy_index']  = 0;
+				$state['core_index']  = 0;
+				$state['copy_offset'] = 0;
+				$state['core_offset'] = 0;
 				self::save( $state );
 				UWP_Helpers::debug_log( sprintf( 'import %s: urls updated (%d pairs)', $state['job_id'], UWP_Helpers::safe_count( $state['pairs'] ) ) );
 				return self::progress( $state, __( 'URLs updated. Copying files…', 'unboundwp' ), 76 );
@@ -591,41 +665,85 @@ class UWP_Import {
 		}
 
 		// --- Step 5: catalogue staged files (resumable directory walk) --------
-		// Builds copy_list a few hundred entries per tick so even enormous
-		// media libraries can't blow a single request's time budget.
+		// Two work lists are built on DISK (copylist.tsv / corelist.tsv), a
+		// few hundred entries per tick. They deliberately never live in the
+		// job state: a 100k-file site used to carry ~30 MB of JSON there and
+		// re-encode it on every single tick.
 		if ( 'files_scan' === $state['step'] ) {
-			if ( ! isset( $state['scan_stack'] ) ) {
-				$state['scan_stack'] = array( $state['stage_dir'] );
-				$state['copy_list']  = array();
-				$state['core_list']  = array();
+			$lists = self::work_lists( $state );
+			$has_legacy = ( ! empty( $state['copy_list'] ) && is_array( $state['copy_list'] ) )
+				|| ( ! empty( $state['core_list'] ) && is_array( $state['core_list'] ) );
+			if ( $has_legacy ) {
+				if ( empty( $state['scan_stack'] ) ) {
+					// Scan was already finished: spill the lists, skip the
+					// entries already copied, and jump straight to copying.
+					if ( self::adopt_legacy_lists( $state ) ) {
+						self::save( $state );
+						return self::progress( $state, __( 'URLs updated. Copying files…', 'unboundwp' ), 76 );
+					}
+				} else {
+					// Scan interrupted mid-directory under an older version:
+					// seed the on-disk lists with what it had (nothing was
+					// copied yet) and keep scanning from where it stopped.
+					self::adopt_legacy_lists( $state, false, false );
+					self::save( $state );
+				}
 			}
+			if ( ! isset( $state['scan_stack'] ) ) {
+				$state['scan_stack']  = array( $state['stage_dir'] );
+				$state['copy_total']  = 0;
+				$state['core_total']  = 0;
+				$state['copy_index']  = 0;
+				$state['core_index']  = 0;
+				$state['copy_offset'] = 0;
+				$state['core_offset'] = 0;
+				@file_put_contents( $lists['copy'], '' ); // phpcs:ignore
+				@file_put_contents( $lists['core'], '' ); // phpcs:ignore
+			}
+			$copy_lines = array();
+			$core_lines = array();
 			while ( ! empty( $state['scan_stack'] ) && ! UWP_Helpers::out_of_time( $started ) ) {
-				$dir = array_pop( $state['scan_stack'] );
-				if ( ! is_dir( $dir ) || ! is_readable( $dir ) ) {
+				$dir    = array_pop( $state['scan_stack'] );
+				$dir_io = UWP_Helpers::win_path( $dir );
+				if ( ! is_dir( $dir_io ) || ! is_readable( $dir_io ) ) {
 					continue;
 				}
-				// Streamed, never scandir() (monster dirs), with re-queue +
-				// assoc dedupe so an interrupted directory resumes safely.
-				$handle = @opendir( $dir ); // phpcs:ignore
+				// Streamed, never scandir() (monster dirs). When a tick
+				// ends mid-directory the directory is re-queued and readdir()
+				// replays its head - the persisted counter makes us skip
+				// exactly those entries, so an interrupted scan cannot
+				// duplicate hundreds of list lines.
+				$skip_seen = 0;
+				if ( isset( $state['scan_seen']['dir'], $state['scan_seen']['count'] )
+					&& $state['scan_seen']['dir'] === $dir ) {
+					$skip_seen = (int) $state['scan_seen']['count'];
+				}
+				$handle = @opendir( $dir_io ); // phpcs:ignore
 				if ( false === $handle ) {
 					continue;
 				}
 				$finished_dir = true;
+				$seen         = 0;
 				while ( false !== ( $entry = readdir( $handle ) ) ) {
+					$seen++;
+					if ( $seen <= $skip_seen ) {
+						continue; // replayed entry from the previous tick.
+					}
 					if ( '.' === $entry || '..' === $entry ) {
 						continue;
 					}
-					$full = $dir . DIRECTORY_SEPARATOR . $entry;
-					if ( is_link( $full ) ) {
+					$full    = $dir . DIRECTORY_SEPARATOR . $entry;
+					$full_io = UWP_Helpers::win_path( $full );
+					if ( is_link( $full_io ) ) {
 						continue; // never follow symlinks out of staging.
 					}
-					if ( is_dir( $full ) ) {
+					if ( is_dir( $full_io ) ) {
 						$state['scan_stack'][] = $full;
 						continue;
 					}
 					// Regular files only (see is_regular_file: FIFOs and
 					// friends would hang or corrupt the copy).
-					if ( ! UWP_Helpers::is_regular_file( $full ) ) {
+					if ( ! UWP_Helpers::is_regular_file( $full_io ) ) {
 						continue;
 					}
 					$rel = self::stage_relative( $state['stage_dir'], $full );
@@ -646,18 +764,22 @@ class UWP_Import {
 						if ( ! empty( $state['keep_core'] ) ) {
 							continue;
 						}
-						$state['core_list'][ $rel ] = array(
-							'from' => $full,
-							'rel'  => $rel,
-						);
+						$core_lines[] = $full . "\t" . $rel;
+						$state['core_total'] = (int) $state['core_total'] + 1;
+						if ( UWP_Helpers::safe_count( $core_lines ) >= 200 ) {
+							self::append_lines( $lists['core'], $core_lines );
+							$core_lines = array();
+						}
 						continue;
 					}
 					$dest = self::map_to_live( $rel );
 					if ( null !== $dest ) {
-						$state['copy_list'][ $rel ] = array(
-							'from' => $full,
-							'to'   => $dest,
-						);
+						$copy_lines[] = $full . "\t" . $dest;
+						$state['copy_total'] = (int) $state['copy_total'] + 1;
+						if ( UWP_Helpers::safe_count( $copy_lines ) >= 200 ) {
+							self::append_lines( $lists['copy'], $copy_lines );
+							$copy_lines = array();
+						}
 					}
 					if ( UWP_Helpers::out_of_time( $started ) ) {
 						$finished_dir = false;
@@ -666,9 +788,22 @@ class UWP_Import {
 				}
 				closedir( $handle );
 				if ( ! $finished_dir ) {
+					// Remember how far into this directory we got; the next
+					// tick reopens it and skips exactly these entries.
+					$state['scan_seen'] = array(
+						'dir'   => $dir,
+						'count' => $seen,
+					);
 					$state['scan_stack'][] = $dir;
 					break;
 				}
+				unset( $state['scan_seen'] );
+			}
+			if ( UWP_Helpers::safe_count( $copy_lines ) > 0 ) {
+				self::append_lines( $lists['copy'], $copy_lines );
+			}
+			if ( UWP_Helpers::safe_count( $core_lines ) > 0 ) {
+				self::append_lines( $lists['core'], $core_lines );
 			}
 			self::save( $state );
 			if ( ! empty( $state['scan_stack'] ) ) {
@@ -677,19 +812,19 @@ class UWP_Import {
 					sprintf(
 						/* translators: %d = files catalogued so far */
 						__( 'Cataloguing files… (%d found)', 'unboundwp' ),
-						UWP_Helpers::safe_count( isset( $state['copy_list'] ) ? $state['copy_list'] : array() )
+						(int) $state['copy_total'] + (int) $state['core_total']
 					),
 					75
 				);
 			}
 			unset( $state['scan_stack'] );
-			$state['copy_list']   = array_values( isset( $state['copy_list'] ) && is_array( $state['copy_list'] ) ? $state['copy_list'] : array() );
-			$state['core_list']   = array_values( isset( $state['core_list'] ) && is_array( $state['core_list'] ) ? $state['core_list'] : array() );
-			$state['copy_index'] = 0;
-			$state['core_index'] = 0;
+			$state['copy_index']  = 0;
+			$state['core_index']  = 0;
+			$state['copy_offset'] = 0;
+			$state['core_offset'] = 0;
 			$state['step']        = 'files';
 			self::save( $state );
-			UWP_Helpers::debug_log( sprintf( 'import %s: catalogued %d files (%d core) to copy', $state['job_id'], UWP_Helpers::safe_count( $state['copy_list'] ), UWP_Helpers::safe_count( $state['core_list'] ) ) );
+			UWP_Helpers::debug_log( sprintf( 'import %s: catalogued %d files (%d core) to copy', $state['job_id'], (int) $state['copy_total'], (int) $state['core_total'] ) );
 			// Disk guard BEFORE any live writes: running out mid-copy is
 			// exactly the half-written-tree class. Resumable: free space
 			// and Resume - the catalogue above is saved.
@@ -705,73 +840,49 @@ class UWP_Import {
 		// Live content goes straight to its destination; core files go to
 		// a staging area for the atomic swap in the next step (never live
 		// file-by-file - a half-swapped core would fatal every request).
+		// Work comes from the on-disk lists, so resuming is a byte seek and
+		// the job state stays a few KB no matter how many files there are.
 		if ( 'files' === $state['step'] ) {
-			if ( ! isset( $state['copy_list'] ) || ! is_array( $state['copy_list'] ) ) {
-				$state['copy_list'] = array();
+			// Job resumed from a version that kept the copy lists in the
+			// state array (pre-1.1.0) and already LEFT the scan step: spill
+			// them now, or the totals below would look empty and the copy
+			// phase would be skipped entirely.
+			if ( ! isset( $state['copy_total'] ) && self::adopt_legacy_lists( $state ) ) {
+				self::save( $state );
 			}
+			$lists      = self::work_lists( $state );
+			$total      = isset( $state['copy_total'] ) ? (int) $state['copy_total'] : 0;
+			$core_total = isset( $state['core_total'] ) ? (int) $state['core_total'] : 0;
 			if ( ! isset( $state['copy_index'] ) ) {
 				$state['copy_index'] = 0;
 			}
-			$total     = UWP_Helpers::safe_count( $state['copy_list'] );
-			$core_total = isset( $state['core_list'] ) && is_array( $state['core_list'] ) ? UWP_Helpers::safe_count( $state['core_list'] ) : 0;
-			$deadline  = $started + UWP_AJAX_TIME_BUDGET;
-			while ( $state['copy_index'] < $total && ! UWP_Helpers::out_of_time( $started ) ) {
-				$batch = 0;
-				while ( $state['copy_index'] < $total && $batch < 200 && ! UWP_Helpers::out_of_time( $started ) ) {
-					$item = $state['copy_list'][ $state['copy_index'] ];
-					// A single giant file must not overrun the tick either:
-					// copy_one() aborts mid-file past the deadline, deletes
-					// the partial copy, and reports it so the next tick
-					// retries that file from scratch. Never corrupt, just
-					// an extra tick for freak files. Skips (unreadable
-					// source / unwritable dest) are RECORDED, not silent:
-					// a half-restored theme with no report is how sites
-					// come back whitescreened with no explanation.
-					$why = null;
-					if ( ! self::copy_one( $item['from'], $item['to'], $deadline, $why ) ) {
-						break 2;
-					}
-					if ( null !== $why ) {
-						self::record_skipped_file( $state, self::short_path( $item['to'] ), $why );
-					}
-					$state['copy_index']++;
-					$batch++;
-				}
+			if ( ! isset( $state['core_index'] ) ) {
+				$state['core_index'] = 0;
 			}
-			if ( $state['copy_index'] >= $total && ! isset( $state['core_list'] ) ) {
-				$state['core_list'] = array();
+			if ( ! isset( $state['copy_offset'] ) ) {
+				$state['copy_offset'] = 0;
 			}
-			if ( $state['copy_index'] >= $total ) {
-				if ( ! isset( $state['core_index'] ) ) {
-					$state['core_index'] = 0;
-				}
-				$stage_core = trailingslashit( $state['work_dir'] ) . 'corestage/';
-				while ( $state['core_index'] < $core_total && ! UWP_Helpers::out_of_time( $started ) ) {
-					$item = $state['core_list'][ $state['core_index'] ];
-					$dest = UWP_Helpers::safe_join( $stage_core, $item['rel'] );
-					if ( false === $dest ) {
-						$state['core_index']++;
-						continue;
-					}
-					$dir = dirname( $dest );
-					if ( ! file_exists( $dir ) ) {
-						wp_mkdir_p( $dir );
-					}
-					$why = null;
-					if ( ! self::copy_one( $item['from'], $dest, $deadline, $why ) ) {
-						break;
-					}
-					if ( null !== $why ) {
-						self::record_skipped_file( $state, 'corestage/' . ( isset( $item['rel'] ) ? $item['rel'] : basename( $dest ) ), $why );
-					}
-					$state['core_index']++;
-				}
+			if ( ! isset( $state['core_offset'] ) ) {
+				$state['core_offset'] = 0;
+			}
+			$deadline = $started + UWP_Helpers::time_budget();
+			$stage_core = trailingslashit( $state['work_dir'] ) . 'corestage/';
+
+			// Phase 1: site content.
+			if ( (int) $state['copy_index'] < $total ) {
+				self::copy_list_tick( $state, $lists['copy'], 'copy', $deadline, $started, $stage_core );
+			}
+			// Phase 2: core staging (only once all content landed, so a
+			// giant media library cannot keep the core pending forever).
+			if ( (int) $state['copy_index'] >= $total && (int) $state['core_index'] < $core_total ) {
+				self::copy_list_tick( $state, $lists['core'], 'core', $deadline, $started, $stage_core );
 			}
 			self::save( $state );
-			$done_units  = $state['copy_index'] + ( isset( $state['core_index'] ) ? (int) $state['core_index'] : 0 );
-			$all_units   = $total + $core_total;
-			$pct = 76 + (int) ( 18 * ( $all_units > 0 ? $done_units / $all_units : 1 ) );
-			if ( $state['copy_index'] >= $total && ( isset( $state['core_index'] ) ? (int) $state['core_index'] : 0 ) >= $core_total ) {
+
+			$done_units = (int) $state['copy_index'] + (int) $state['core_index'];
+			$all_units  = $total + $core_total;
+			$pct        = 76 + (int) ( 18 * ( $all_units > 0 ? $done_units / $all_units : 1 ) );
+			if ( (int) $state['copy_index'] >= $total && (int) $state['core_index'] >= $core_total ) {
 				$state['step'] = 'core';
 				self::save( $state );
 				UWP_Helpers::debug_log( sprintf( 'import %s: copied %d files (%d core staged)', $state['job_id'], $total, $core_total ) );
@@ -868,9 +979,26 @@ class UWP_Import {
 			self::restore_session( $state );
 			self::finalize( $state );
 
+			// An archive that was uploaded for this run belongs on the
+			// Backups page, not in the temp dir forever: adopt it (or leave
+			// it alone when the restore came from an existing backup).
+			$adopted = '';
+			if ( ! empty( $state['archive'] ) && is_string( $state['archive'] ) ) {
+				$upload_dir = trailingslashit( uwp_temp_dir() ) . 'uploads/';
+				$upload_nrm = wp_normalize_path( $upload_dir );
+				$archive_nrm = wp_normalize_path( $state['archive'] );
+				if ( 0 === strpos( $archive_nrm, $upload_nrm ) ) {
+					$adopted = UWP_Helpers::adopt_upload( $state['archive'] );
+				}
+			}
+
 			$message = __( 'Restore complete. Your site is back.', 'unboundwp' );
 			if ( ! empty( $state['session'] ) && empty( $state['session_ok'] ) ) {
 				$message = __( 'Restore complete. Please log in again with the restored site’s user account.', 'unboundwp' );
+			}
+			if ( '' !== $adopted ) {
+				/* translators: %s = backup file name */
+				$message .= ' ' . sprintf( __( 'The uploaded backup was kept on the Backups page as %s.', 'unboundwp' ), $adopted );
 			}
 			if ( ! empty( $state['reactivation']['skipped'] ) || ! empty( $state['reactivation']['failed'] ) ) {
 				$notes = array_merge(
@@ -974,6 +1102,24 @@ class UWP_Import {
 		// operator explicitly chose this backup.
 		$state['warnings'] = self::compat_warnings( $state['package'] );
 
+		// A password supplied for a plain backup is ignored (decoder_options
+		// makes sure of that); say so instead of silently ignoring it.
+		if ( isset( $state['package']['Encrypted'] ) && empty( $state['package']['Encrypted'] )
+			&& isset( $state['password'] ) && '' !== (string) $state['password'] ) {
+			$state['warnings'][] = __( 'This backup is not password-protected, so the password you entered was ignored.', 'unboundwp' );
+		}
+
+		// Multisite restores are cross-network by definition: the table
+		// layout (wp_2_*, sitemeta) cannot be reconciled automatically.
+		// Say so up front instead of failing halfway.
+		$src_multi = ! empty( $state['package']['Multisite'] );
+		$dst_multi = function_exists( 'is_multisite' ) ? is_multisite() : false;
+		if ( $src_multi || $dst_multi ) {
+			$state['warnings'][] = $src_multi
+				? __( 'This backup was made on a WordPress Multisite network. Only a single-site restore is supported: per-site tables (wp_2_*) are created but the network itself is not linked. Review the site after the restore.', 'unboundwp' )
+				: __( 'This install is a WordPress Multisite network but the backup is single-site. The main site is restored; other sites keep their current data.', 'unboundwp' );
+		}
+
 		// Table-prefix handling: statements are remapped dump → live in the
 		// data during import (reference behavior - no wp-config changes, no
 		// host-specific failure modes), so a mismatch is handled, not fatal.
@@ -1054,12 +1200,56 @@ class UWP_Import {
 			if ( null === $entry ) {
 				// EOF block.
 				$finished = true;
-				$state['extract_offset'] = ftell( $handle );
+				$state['extract_offset'] = self::tell( $handle, (int) $state['extract_offset'] );
 				break;
 			}
 			$dest = UWP_Helpers::safe_join( $state['stage_dir'], $entry['name'] );
 			if ( false === $dest ) {
 				throw new Exception( sprintf( __( 'Archive contains an unsafe path: %s', 'unboundwp' ), $entry['name'] ) );
+			}
+			// Windows cannot store names ending in a dot/space (or reserved
+			// device names), but Linux hosts can legitimately contain them.
+			// Field case: a stray "Interface." next to "Interface.php" used
+			// to abort the whole restore. Drain the entry and move on.
+			if ( UWP_Helpers::is_invalid_windows_path( $entry['name'] ) ) {
+				UWP_Archive::skip_data( $handle, $entry['size'] );
+				$state['extracted']++;
+				$state['extract_offset'] = self::tell( $handle, (int) $state['extract_offset'] );
+				$state['unwritable_entries'] = ( isset( $state['unwritable_entries'] ) ? (int) $state['unwritable_entries'] : 0 ) + 1;
+				if ( (int) $state['unwritable_entries'] <= 5 ) {
+					self::core_note(
+						$state,
+						sprintf(
+							/* translators: %s = archive path */
+							__( 'Skipped "%s": this file name is not valid on Windows (trailing dot/space or reserved name).', 'unboundwp' ),
+							$entry['name']
+						)
+					);
+				}
+				UWP_Helpers::debug_log( sprintf( 'import %s: skipped OS-invalid entry "%s"', $state['job_id'], $entry['name'] ) );
+				continue;
+			}
+			// Some archivers record a 0-byte DIRECTORY entry (e.g. "assets")
+			// next to the files inside it ("assets/js/..."). A file and a
+			// folder cannot share a name: skip the entry with a precise
+			// reason instead of a generic write failure.
+			if ( is_dir( UWP_Helpers::win_path( $dest ) ) ) {
+				UWP_Archive::skip_data( $handle, $entry['size'] );
+				$state['extracted']++;
+				$state['extract_offset'] = self::tell( $handle, (int) $state['extract_offset'] );
+				$state['unwritable_entries'] = ( isset( $state['unwritable_entries'] ) ? (int) $state['unwritable_entries'] : 0 ) + 1;
+				if ( (int) $state['unwritable_entries'] <= 5 ) {
+					self::core_note(
+						$state,
+						sprintf(
+							/* translators: %s = archive path */
+							__( 'Skipped "%s": the backup lists it as a file but a folder with that name already exists in the archive.', 'unboundwp' ),
+							$entry['name']
+						)
+					);
+				}
+				UWP_Helpers::debug_log( sprintf( 'import %s: skipped directory/file name conflict "%s"', $state['job_id'], $entry['name'] ) );
+				continue;
 			}
 			// First-wins for ARCHIVE-ROOT rels: a poisoned archive can carry
 			// the same root rel twice (field case: a stub index.php AFTER
@@ -1077,7 +1267,7 @@ class UWP_Import {
 					UWP_Archive::extract_entry( $handle, $entry, $tmp, $options );
 					@unlink( $tmp ); // phpcs:ignore - drained, never staged.
 					$state['extracted']++;
-					$state['extract_offset'] = ftell( $handle );
+					$state['extract_offset'] = self::tell( $handle, (int) $state['extract_offset'] );
 					self::core_note(
 						$state,
 						sprintf(
@@ -1096,13 +1286,39 @@ class UWP_Import {
 				}
 				$state['root_seen'][ $rel_key ] = true;
 			}
-			$dir = dirname( $dest );
+			$dir = UWP_Helpers::win_path( dirname( $dest ) );
 			if ( ! file_exists( $dir ) ) {
 				wp_mkdir_p( $dir );
 			}
-			UWP_Archive::extract_entry( $handle, $entry, $dest, $options );
+			try {
+				UWP_Archive::extract_entry( $handle, $entry, $dest, $options );
+			} catch ( Exception $e ) {
+				// "Cannot write file" means fopen() failed BEFORE any data
+				// was read (unwritable folder, very long path on an old
+				// host, odd name). One such entry must never abort an
+				// otherwise good restore: drain it and record it.
+				if ( false !== strpos( $e->getMessage(), 'Cannot write file' ) ) {
+					UWP_Archive::skip_data( $handle, $entry['size'] );
+					$state['extracted']++;
+					$state['extract_offset'] = self::tell( $handle, (int) $state['extract_offset'] );
+					$state['unwritable_entries'] = ( isset( $state['unwritable_entries'] ) ? (int) $state['unwritable_entries'] : 0 ) + 1;
+					if ( (int) $state['unwritable_entries'] <= 5 ) {
+						self::core_note(
+							$state,
+							sprintf(
+								/* translators: %s = archive path */
+								__( 'Skipped "%s": this server could not create that file path.', 'unboundwp' ),
+								$entry['name']
+							)
+						);
+					}
+					UWP_Helpers::debug_log( sprintf( 'import %s: skipped uncreatable entry "%s"', $state['job_id'], $entry['name'] ) );
+					continue;
+				}
+				throw $e;
+			}
 			$state['extracted']++;
-			$state['extract_offset'] = ftell( $handle );
+			$state['extract_offset'] = self::tell( $handle, (int) $state['extract_offset'] );
 			// Extraction overwrites the same files, so replaying is safe,
 			// still, checkpoint regularly so a dead tick loses little.
 			if ( ++$since_save >= 100 ) {
@@ -1126,8 +1342,18 @@ class UWP_Import {
 		if ( ! empty( $state['package']['Compression']['Enabled'] ) ) {
 			$compression = isset( $state['package']['Compression']['Type'] ) ? $state['package']['Compression']['Type'] : 'gzip';
 		}
+		// Only use the password when the backup actually claims to be
+		// encrypted. Typing a password for a plain backup used to make
+		// every entry look encrypted and fail with "wrong password".
+		// A package without the flag (foreign .wpress) is treated as
+		// "unknown", so a supplied password is still honored.
+		$encrypted = true;
+		if ( isset( $state['package'] ) && is_array( $state['package'] ) && array_key_exists( 'Encrypted', $state['package'] ) ) {
+			$encrypted = ! empty( $state['package']['Encrypted'] );
+		}
+		$password = ( $encrypted && isset( $state['password'] ) && '' !== (string) $state['password'] ) ? (string) $state['password'] : null;
 		return array(
-			'password'    => '' !== $state['password'] ? $state['password'] : null,
+			'password'    => $password,
 			'compression' => $compression,
 		);
 	}
@@ -1682,6 +1908,8 @@ class UWP_Import {
 	 * @return bool True when the rename landed.
 	 */
 	protected static function rename_with_retries( $from, $to, $tries = 3 ) {
+		$from = UWP_Helpers::win_path( $from );
+		$to   = UWP_Helpers::win_path( $to );
 		for ( $i = 0; $i < $tries; $i++ ) {
 			if ( @rename( $from, $to ) ) { // phpcs:ignore
 				return true;
@@ -1756,18 +1984,19 @@ class UWP_Import {
 			);
 		}
 		$fb       = &$state['core_fb'];
-		$deadline = $started > 0 ? $started + UWP_AJAX_TIME_BUDGET : 0;
+		$deadline = $started > 0 ? $started + UWP_Helpers::time_budget() : 0;
 
 		// Phase 1: catalogue (resumable directory walk).
 		while ( ! empty( $fb['stack'] ) ) {
 			if ( $started > 0 && UWP_Helpers::out_of_time( $started ) ) {
 				return true;
 			}
-			$d = array_pop( $fb['stack'] );
-			if ( ! is_dir( $d ) || ! is_readable( $d ) ) {
+			$d    = array_pop( $fb['stack'] );
+			$d_io = UWP_Helpers::win_path( $d );
+			if ( ! is_dir( $d_io ) || ! is_readable( $d_io ) ) {
 				continue;
 			}
-			$handle = @opendir( $d ); // phpcs:ignore
+			$handle = @opendir( $d_io ); // phpcs:ignore
 			if ( false === $handle ) {
 				continue;
 			}
@@ -1776,15 +2005,16 @@ class UWP_Import {
 				if ( '.' === $entry || '..' === $entry ) {
 					continue;
 				}
-				$full = $d . DIRECTORY_SEPARATOR . $entry;
-				if ( is_link( $full ) ) {
+				$full    = $d . DIRECTORY_SEPARATOR . $entry;
+				$full_io = UWP_Helpers::win_path( $full );
+				if ( is_link( $full_io ) ) {
 					continue;
 				}
-				if ( is_dir( $full ) ) {
+				if ( is_dir( $full_io ) ) {
 					$fb['stack'][] = $full;
 					continue;
 				}
-				if ( ! UWP_Helpers::is_regular_file( $full ) ) {
+				if ( ! UWP_Helpers::is_regular_file( $full_io ) ) {
 					continue;
 				}
 				$rel = self::stage_relative( $src . '/', $full );
@@ -1874,11 +2104,11 @@ class UWP_Import {
 			if ( '.' === $entry || '..' === $entry ) {
 				continue;
 			}
-			$full = $stage_core . '/' . $entry;
+			$full    = UWP_Helpers::win_path( $stage_core . '/' . $entry );
 			if ( is_dir( $full ) || ! in_array( $entry, UWP_Helpers::core_root_files(), true ) ) {
 				continue;
 			}
-			$to = $abs . '/' . $entry;
+			$to = UWP_Helpers::win_path( $abs . '/' . $entry );
 			if ( file_exists( $to ) && ! is_writable( $to ) ) {
 				@chmod( $to, 0644 ); // phpcs:ignore
 			}
@@ -1982,6 +2212,22 @@ class UWP_Import {
 	}
 
 	/**
+	 * ftell() that never returns false.
+	 *
+	 * A failed ftell() used to be persisted as "false", which casts to 0
+	 * and silently restarts a list/archive from the beginning. Keep the
+	 * last known offset instead.
+	 *
+	 * @param resource $handle Open handle.
+	 * @param int      $fallback Offset to keep when ftell fails.
+	 * @return int
+	 */
+	protected static function tell( $handle, $fallback ) {
+		$pos = ftell( $handle );
+		return ( false === $pos ) ? (int) $fallback : (int) $pos;
+	}
+
+	/**
 	 * Staging-absolute path to archive-relative path ("/" separators).
 	 *
 	 * @param string $stage Staging dir.
@@ -1995,6 +2241,231 @@ class UWP_Import {
 			return null;
 		}
 		return ltrim( substr( $path, strlen( $root ) ), '/' );
+	}
+
+	/**
+	 * Absolute paths of the two on-disk work lists (copy + core).
+	 *
+	 * @param array $state Job state (by reference; defaults persisted).
+	 * @return array{copy:string,core:string}
+	 * @throws Exception When the job has no work dir to anchor them.
+	 */
+	protected static function work_lists( &$state ) {
+		if ( empty( $state['work_dir'] ) ) {
+			throw new Exception( __( 'Import state is corrupt (no work directory). Start a new restore.', 'unboundwp' ) );
+		}
+		$base = trailingslashit( $state['work_dir'] );
+		if ( empty( $state['copy_file'] ) ) {
+			$state['copy_file'] = $base . 'copylist.tsv';
+		}
+		if ( empty( $state['core_file'] ) ) {
+			$state['core_file'] = $base . 'corelist.tsv';
+		}
+		return array(
+			'copy' => $state['copy_file'],
+			'core' => $state['core_file'],
+		);
+	}
+
+	/**
+	 * Append lines to a work list in one write.
+	 *
+	 * @param string $path Absolute list path.
+	 * @param array  $lines Lines WITHOUT trailing newline.
+	 * @throws Exception When the list cannot be written.
+	 */
+	protected static function append_lines( $path, $lines ) {
+		if ( empty( $lines ) ) {
+			return;
+		}
+		$payload = implode( "\n", $lines ) . "\n";
+		if ( false === @file_put_contents( $path, $payload, FILE_APPEND | LOCK_EX ) ) { // phpcs:ignore
+			throw new Exception( __( 'Cannot write the import work list. Check that the uploads directory is writable.', 'unboundwp' ) );
+		}
+	}
+
+	/**
+	 * Bridge for jobs started before work lists moved to disk.
+	 *
+	 * Their copy_list/core_list arrays are spilled to TSV, skipping the
+	 * entries already copied so no work is repeated. Returns true when
+	 * the job was migrated (caller then jumps to the copy step).
+	 *
+	 * @param array $state Job state (by reference).
+	 * @param bool  $skip_copied Drop entries the old job already copied.
+	 * @param bool  $change_step Switch to the copy step (false while the old
+	 *                           job was still scanning).
+	 * @return bool True when legacy lists were adopted.
+	 */
+	protected static function adopt_legacy_lists( &$state, $skip_copied = true, $change_step = true ) {
+		$copy = isset( $state['copy_list'] ) && is_array( $state['copy_list'] ) ? $state['copy_list'] : array();
+		$core = isset( $state['core_list'] ) && is_array( $state['core_list'] ) ? $state['core_list'] : array();
+		if ( empty( $copy ) && empty( $core ) ) {
+			unset( $state['copy_list'], $state['core_list'] );
+			return false;
+		}
+		$lists = self::work_lists( $state );
+		$start = ( $skip_copied && isset( $state['copy_index'] ) ) ? max( 0, (int) $state['copy_index'] ) : 0;
+		$lines = array();
+		foreach ( array_slice( array_values( $copy ), $start ) as $item ) {
+			if ( is_array( $item ) && isset( $item['from'], $item['to'] ) ) {
+				$lines[] = $item['from'] . "\t" . $item['to'];
+			}
+		}
+		@file_put_contents( $lists['copy'], '' ); // phpcs:ignore
+		self::append_lines( $lists['copy'], $lines );
+		$state['copy_total']  = UWP_Helpers::safe_count( $lines );
+		$state['copy_index']  = 0;
+		$state['copy_offset'] = 0;
+
+		$cstart = ( $skip_copied && isset( $state['core_index'] ) ) ? max( 0, (int) $state['core_index'] ) : 0;
+		$clines = array();
+		foreach ( array_slice( array_values( $core ), $cstart ) as $item ) {
+			if ( is_array( $item ) && isset( $item['from'], $item['rel'] ) ) {
+				$clines[] = $item['from'] . "\t" . $item['rel'];
+			}
+		}
+		@file_put_contents( $lists['core'], '' ); // phpcs:ignore
+		self::append_lines( $lists['core'], $clines );
+		$state['core_total']  = UWP_Helpers::safe_count( $clines );
+		$state['core_index']  = 0;
+		$state['core_offset'] = 0;
+
+		unset( $state['copy_list'], $state['core_list'] );
+		if ( $change_step ) {
+			unset( $state['scan_stack'] );
+			$state['step'] = 'files';
+		}
+		UWP_Helpers::debug_log( sprintf( 'import %s: migrated legacy file lists (%d + %d left)', $state['job_id'], $state['copy_total'], $state['core_total'] ) );
+		return true;
+	}
+
+	/**
+	 * Copy one budgeted slice from a work list.
+	 *
+	 * Each line is "source-path TAB destination" (copy) or
+	 * "source-path TAB archive-relative-path" (core, staged under
+	 * corestage/). The byte offset is persisted, so resume continues at
+	 * the exact line - no re-scan, no duplicate work.
+	 *
+	 * @param array  $state Job state (by reference).
+	 * @param string $list_path Absolute list file.
+	 * @param string $kind 'copy' or 'core'.
+	 * @param float  $deadline Microtime deadline for one file.
+	 * @param float  $started Tick start microtime.
+	 * @param string $stage_core Absolute core staging dir.
+	 * @throws Exception When the list cannot be read.
+	 */
+	protected static function copy_list_tick( &$state, $list_path, $kind, $deadline, $started, $stage_core ) {
+		$index_key  = ( 'core' === $kind ) ? 'core_index' : 'copy_index';
+		$offset_key = ( 'core' === $kind ) ? 'core_offset' : 'copy_offset';
+		$total      = ( 'core' === $kind ) ? (int) $state['core_total'] : (int) $state['copy_total'];
+
+		$handle = @fopen( $list_path, 'rb' ); // phpcs:ignore
+		if ( false === $handle ) {
+			if ( $total > 0 ) {
+				throw new Exception( __( 'The import work list is missing. Please start the restore again.', 'unboundwp' ) );
+			}
+			return;
+		}
+		if ( (int) $state[ $offset_key ] > 0 ) {
+			fseek( $handle, (int) $state[ $offset_key ] );
+		}
+
+		while ( (int) $state[ $index_key ] < $total && ! UWP_Helpers::out_of_time( $started ) ) {
+			$line_start = ftell( $handle );
+			$line       = fgets( $handle ); // phpcs:ignore
+			if ( false === $line ) {
+				// List shorter than the recorded total (should not happen):
+				// finish instead of spinning here forever.
+				UWP_Helpers::debug_log( sprintf( 'import %s: %s list ended early at %d/%d', $state['job_id'], $kind, (int) $state[ $index_key ], $total ) );
+				$state[ $index_key ] = $total;
+				break;
+			}
+			$complete = ( "\n" === substr( $line, -1 ) );
+			$line     = rtrim( $line, "\r\n" );
+			$state[ $index_key ] = (int) $state[ $index_key ] + 1;
+			if ( ! $complete ) {
+				// Crash-truncated final line: drop it (the list is only
+				// appended to while scanning) rather than retrying it on
+				// every tick.
+				$state[ $offset_key ] = self::tell( $handle, (int) $state[ $offset_key ] );
+				break;
+			}
+			if ( '' === $line ) {
+				$state[ $offset_key ] = self::tell( $handle, (int) $state[ $offset_key ] );
+				continue;
+			}
+			$parts = explode( "\t", $line, 2 );
+			if ( UWP_Helpers::safe_count( $parts ) !== 2 || '' === $parts[0] ) {
+				$state[ $offset_key ] = self::tell( $handle, (int) $state[ $offset_key ] );
+				continue;
+			}
+			$from = $parts[0];
+			$to   = $parts[1];
+
+			if ( 'core' === $kind ) {
+				$dest = UWP_Helpers::safe_join( $stage_core, $to );
+				if ( false === $dest ) {
+					$state[ $offset_key ] = self::tell( $handle, (int) $state[ $offset_key ] );
+					continue;
+				}
+				$dir = UWP_Helpers::win_path( dirname( $dest ) );
+				if ( ! file_exists( $dir ) ) {
+					wp_mkdir_p( $dir );
+				}
+			} else {
+				$dest = $to;
+			}
+
+			$why = null;
+			// A single giant file must not overrun the tick: the copy aborts
+			// past the deadline, deletes its partial output, and the list
+			// offset stays put so the NEXT tick retries that file.
+			if ( ! self::copy_one_smart( $from, $dest, $deadline, $why ) ) {
+				$state[ $index_key ] = max( 0, (int) $state[ $index_key ] - 1 );
+				if ( false !== $line_start ) {
+					$state[ $offset_key ] = $line_start;
+				}
+				break;
+			}
+			if ( null !== $why ) {
+				self::record_skipped_file( $state, ( 'core' === $kind ) ? ( 'corestage/' . $to ) : self::short_path( $dest ), $why );
+			}
+			$state[ $offset_key ] = self::tell( $handle, (int) $state[ $offset_key ] );
+
+			// Checkpoint periodically: a hard death loses at most the
+			// in-flight file, and the state file stays tiny.
+			if ( 0 === ( (int) $state[ $index_key ] % 100 ) ) {
+				self::save( $state );
+			}
+		}
+		fclose( $handle );
+	}
+
+	/**
+	 * Copy one file, choosing the safest strategy for its size.
+	 *
+	 * Small files (PHP, JS, CSS, theme templates) are written via
+	 * temp+rename so a request that lands mid-copy never executes a
+	 * truncated file. Large media stream directly (atomic rename of
+	 * multi-GB files is slower and adds no safety: a partial copy is
+	 * retried because the list offset only advances after success).
+	 *
+	 * @param string $from Source.
+	 * @param string $to Destination.
+	 * @param float  $deadline Microtime deadline (0 = none).
+	 * @param string|null $why Out-param reason (see copy_one()).
+	 * @return bool True when the file is done (or safely skippable).
+	 */
+	protected static function copy_one_smart( $from, $to, $deadline = 0, &$why = null ) {
+		$from_io = UWP_Helpers::win_path( $from );
+		clearstatcache( true, $from_io );
+		$size = ( is_file( $from_io ) && ! is_link( $from_io ) ) ? (int) filesize( $from_io ) : 0;
+		if ( $size <= 1048576 ) {
+			return self::copy_one_atomic( $from, $to, $deadline, $why );
+		}
+		return self::copy_one( $from, $to, $deadline, $why );
 	}
 
 	/**
@@ -2027,6 +2498,12 @@ class UWP_Import {
 		// backup contains a different copy. (Both archive layouts covered.)
 		if ( 0 === strpos( $rel, 'wp-content/plugins/unboundwp/' ) || 'wp-content/plugins/unboundwp' === $rel
 			|| 0 === strpos( $rel, 'plugins/unboundwp/' ) || 'plugins/unboundwp' === $rel ) {
+			return null;
+		}
+		// The resurrection loader is written and versioned by THIS install.
+		// Restoring an older/foreign copy reintroduces the historical
+		// "Cannot redeclare" bootstrap fatal.
+		if ( 'wp-content/mu-plugins/unboundwp-loader.php' === $rel || 'mu-plugins/unboundwp-loader.php' === $rel ) {
 			return null;
 		}
 
@@ -2074,6 +2551,40 @@ class UWP_Import {
 	}
 
 	/**
+	 * Whether the destination is already the exact copy we made.
+	 *
+	 * Copies preserve the source mtime, so "same size AND identical mtime
+	 * second" is the signature of a file this job already wrote. Used to
+	 * make resumes and duplicate list entries cheap. Deliberately an
+	 * EQUALITY check: a local file that merely has a newer mtime (typical
+	 * for content edited on the destination) must still be replaced, or
+	 * the restore would silently stop being 1:1.
+	 *
+	 * @param string $from Source path.
+	 * @param string $to Destination path.
+	 * @return bool
+	 */
+	protected static function already_copied( $from, $to ) {
+		$from = UWP_Helpers::win_path( $from );
+		$to   = UWP_Helpers::win_path( $to );
+		if ( ! is_file( $from ) || ! is_file( $to ) || is_link( $to ) ) {
+			return false;
+		}
+		clearstatcache();
+		$fsize = @filesize( $from ); // phpcs:ignore
+		$tsize = @filesize( $to ); // phpcs:ignore
+		if ( false === $fsize || false === $tsize || (int) $fsize !== (int) $tsize ) {
+			return false;
+		}
+		$fm = @filemtime( $from ); // phpcs:ignore
+		$tm = @filemtime( $to ); // phpcs:ignore
+		if ( false === $fm || false === $tm ) {
+			return false;
+		}
+		return (int) $fm === (int) $tm;
+	}
+
+	/**
 	 * Copy one file, creating directories and preserving mtime when possible.
 	 *
 	 * @param string $from Source.
@@ -2088,9 +2599,19 @@ class UWP_Import {
 	 */
 	protected static function copy_one( $from, $to, $deadline = 0, &$why = null ) {
 		$why = null; // definitive on every return: callers may reuse the variable.
+		// Long Linux-style paths need the Windows extended-length prefix.
+		$from = UWP_Helpers::win_path( $from );
+		$to   = UWP_Helpers::win_path( $to );
 		// Never follow symlinks out of staging.
 		if ( is_link( $from ) ) {
 			return true; // nothing to do - count it as handled.
+		}
+		// Resumes and re-scans revisit files that already landed: when the
+		// destination has the same size and an equal-or-newer mtime, the
+		// copy is provably the one we made. Skip it instead of re-writing
+		// gigabytes (this is what makes an interrupted restore cheap).
+		if ( self::already_copied( $from, $to ) ) {
+			return true;
 		}
 		$dir = dirname( $to );
 		if ( ! file_exists( $dir ) ) {
@@ -2146,7 +2667,13 @@ class UWP_Import {
 	 */
 	protected static function copy_one_atomic( $from, $to, $deadline = 0, &$why = null ) {
 		$why = null;
+		// Prefix BEFORE deriving the sidecar so every path stays usable.
+		$from = UWP_Helpers::win_path( $from );
+		$to   = UWP_Helpers::win_path( $to );
 		if ( is_link( $from ) ) {
+			return true;
+		}
+		if ( self::already_copied( $from, $to ) ) {
 			return true;
 		}
 		$dir = dirname( $to );
@@ -2157,12 +2684,14 @@ class UWP_Import {
 			$why = 'unreadable-source';
 			return true;
 		}
-		try {
-			$suffix = bin2hex( random_bytes( 4 ) );
-		} catch ( Exception $e ) {
-			$suffix = uniqid();
+		// Deterministic sidecar instead of a random one: a hard death can
+		// leave at most ONE extra file per destination (reused/overwritten
+		// by the next attempt) instead of a growing pile of temp files in
+		// the live tree.
+		$tmp = $to . '.uwp-part';
+		if ( is_file( $tmp ) ) {
+			@unlink( $tmp ); // phpcs:ignore - stale from a previous attempt.
 		}
-		$tmp = $to . '.uwp-tmp-' . $suffix;
 		$ok  = self::copy_one( $from, $tmp, $deadline, $why );
 		if ( ! $ok ) {
 			@unlink( $tmp ); // phpcs:ignore - deadline abort, nothing touched live.
@@ -2284,8 +2813,9 @@ class UWP_Import {
 		$root  = rtrim( str_replace( '\\', '/', (string) $dir ), '/' );
 		$stack = array( $root );
 		while ( ! empty( $stack ) && UWP_Helpers::safe_count( $out ) < $cap ) {
-			$d = array_pop( $stack );
-			$h = @opendir( $d ); // phpcs:ignore
+			$d    = array_pop( $stack );
+			$d_io = UWP_Helpers::win_path( $d );
+			$h    = @opendir( $d_io ); // phpcs:ignore
 			if ( false === $h ) {
 				continue;
 			}
@@ -2293,15 +2823,16 @@ class UWP_Import {
 				if ( '.' === $entry || '..' === $entry ) {
 					continue;
 				}
-				$full = $d . '/' . $entry;
-				if ( is_link( $full ) ) {
+				$full    = $d . '/' . $entry;
+				$full_io = UWP_Helpers::win_path( $full );
+				if ( is_link( $full_io ) ) {
 					continue;
 				}
-				if ( is_dir( $full ) ) {
+				if ( is_dir( $full_io ) ) {
 					$stack[] = $full;
 					continue;
 				}
-				if ( ! UWP_Helpers::is_regular_file( $full ) ) {
+				if ( ! UWP_Helpers::is_regular_file( $full_io ) ) {
 					continue;
 				}
 				$out[ substr( $full, strlen( $root ) + 1 ) ] = true;
@@ -2405,6 +2936,12 @@ class UWP_Import {
 	 * @param array $state Job state.
 	 */
 	protected static function finalize( &$state ) {
+		// The replace step writes options with direct SQL, which bypasses the
+		// object cache. Flush BEFORE reading anything back, or the fidelity
+		// check and the completion message describe the pre-replace values.
+		if ( function_exists( 'wp_cache_flush' ) ) {
+			wp_cache_flush();
+		}
 		self::restore_theme( $state );
 		// Routing self-heal BEFORE verification: a tagless live structure
 		// (mid-export source edit, or third-party mangling) is restored
@@ -2416,7 +2953,42 @@ class UWP_Import {
 		// the homepage is fetched once. Diffs become warnings (shown in the
 		// completion message), never silent.
 		self::verify_fidelity( $state );
-		self::smoke_test_homepage( $state );
+		$boot = self::smoke_test_homepage( $state );
+		if ( 'error' === $boot ) {
+			// The site does not serve with the plugins that are active.
+			// Leaving them on would hand the operator a 500 admin at the
+			// exact moment they are told "your site is back". Deactivate
+			// them all (UnboundWP stays) so wp-admin works and they can
+			// enable plugins one by one.
+			$off = self::quarantine_active_plugins( $state, 'final homepage check returned HTTP 500' );
+			if ( ! empty( $off ) ) {
+				$after = self::site_boots( $state, 'after finalize quarantine' );
+				if ( true === $after && ! empty( $state['warnings'] ) ) {
+					// Drop the generic "open Site Health" note: it cannot
+					// be followed from a 500 admin, and the note below
+					// states the actual outcome.
+					$state['warnings'] = array_values(
+						array_filter(
+							(array) $state['warnings'],
+							function ( $w ) {
+								return false === strpos( (string) $w, __( 'Homepage check:', 'unboundwp' ) );
+							}
+						)
+					);
+				}
+				self::core_note(
+					$state,
+					true === $after
+						? sprintf(
+							/* translators: 1: number of plugins, 2: comma-separated list */
+							__( 'The site returned HTTP 500 after the restore, so %1$d plugin(s) were left inactive: %2$s. It boots now - enable them one by one under Plugins.', 'unboundwp' ),
+							UWP_Helpers::safe_count( $off ),
+							implode( ', ', array_map( 'basename', $off ) )
+						)
+						: __( 'The site still returns HTTP 500 with every plugin inactive. Check the server error log and the active theme.', 'unboundwp' )
+				);
+			}
+		}
 		self::verify_theme_files( $state );
 		self::summarize_skipped_files( $state );
 		// Builder caches reference old markup - drop the regenerable ones.
@@ -2437,9 +3009,9 @@ class UWP_Import {
 		if ( function_exists( 'wp_cache_flush' ) ) {
 			wp_cache_flush();
 		}
-		// Make sure the new URLs stuck even if replace step was skipped.
-		update_option( 'siteurl', get_option( 'siteurl' ) );
-		update_option( 'home', get_option( 'home' ) );
+		// The replace step already wrote the destination URLs. Re-saving the
+		// values read from a stale cache here used to write the SOURCE URLs
+		// back into the options table and silently undo the replacement.
 	}
 
 	/**
@@ -2474,6 +3046,55 @@ class UWP_Import {
 	 */
 	public static function is_risky_plugin( $plugin ) {
 		foreach ( self::risky_plugin_slugs() as $slug ) {
+			if ( false !== stripos( (string) $plugin, $slug ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Plugins written for one specific hosting panel.
+	 *
+	 * They read credentials/state that only exist on their own host, so
+	 * activating them elsewhere either throws during plugins_loaded or
+	 * hooks into every request and fatals it. Field case: Hostinger's
+	 * helper plugin activated cleanly and then returned HTTP 500 (typed
+	 * static property not initialized) for every page and every AJAX
+	 * request, which bricked the just-restored admin. These are always
+	 * left inactive; the operator can enable them manually if the
+	 * destination really is that host.
+	 *
+	 * @return array Slug fragments.
+	 */
+	protected static function host_vendor_plugin_slugs() {
+		return array(
+			'hostinger',
+			'wpengine',
+			'wpe-',
+			'godaddy',
+			'gd-system',
+			'endurance',
+			'bluehost',
+			'kinsta',
+			'siteground',
+			'sg-cachepress',
+			'dreamhost',
+			'pantheon',
+			'cloudways',
+			'pressable',
+			'nestify',
+		);
+	}
+
+	/**
+	 * Whether a plugin belongs to a hosting panel's runtime.
+	 *
+	 * @param string $plugin Plugin basename, e.g. foo/bar.php.
+	 * @return bool
+	 */
+	public static function is_host_vendor_plugin( $plugin ) {
+		foreach ( self::host_vendor_plugin_slugs() as $slug ) {
 			if ( false !== stripos( (string) $plugin, $slug ) ) {
 				return true;
 			}
@@ -2707,7 +3328,7 @@ class UWP_Import {
 	 */
 	protected static function smoke_test_homepage( &$state ) {
 		if ( ! function_exists( 'wp_remote_get' ) || ! function_exists( 'home_url' ) ) {
-			return;
+			return 'skipped';
 		}
 		$url = home_url( '/' );
 		$r   = wp_remote_get(
@@ -2721,22 +3342,114 @@ class UWP_Import {
 		);
 		if ( is_wp_error( $r ) ) {
 			UWP_Helpers::debug_log( sprintf( 'import %s: homepage check skipped (no loopback: %s)', $state['job_id'], $r->get_error_message() ) );
-			return;
+			return 'skipped';
 		}
 		$code = function_exists( 'wp_remote_retrieve_response_code' ) ? (int) wp_remote_retrieve_response_code( $r ) : 200;
 		$body = function_exists( 'wp_remote_retrieve_body' ) ? (string) wp_remote_retrieve_body( $r ) : 'x';
 		if ( $code >= 500 ) {
 			self::core_note( $state, sprintf( __( 'Homepage check: the restored homepage returns HTTP %d. Open Site Health and Plugins/Themes on the restored site.', 'unboundwp' ), $code ) );
-			return;
+			return 'error';
 		}
 		$text = function_exists( 'wp_strip_all_tags' )
 			? trim( preg_replace( '/\s+/', ' ', wp_strip_all_tags( $body ) ) )
 			: trim( $body );
 		if ( strlen( $text ) < 200 ) {
 			self::core_note( $state, __( 'Homepage check: the restored homepage body looks empty (possible white screen). Check the active theme and recently reactivated plugins.', 'unboundwp' ) );
-			return;
+			return 'empty';
 		}
 		UWP_Helpers::debug_log( sprintf( 'import %s: homepage check OK (HTTP %d, %d bytes text)', $state['job_id'], $code, strlen( $text ) ) );
+		return 'ok';
+	}
+
+	/**
+	 * One lightweight loopback request: does the site still serve?
+	 *
+	 * Activation only includes the plugin's main file; its real
+	 * bootstrap (plugins_loaded, init, every request) runs later. A host
+	 * panel plugin activated cleanly here and then answered HTTP 500 on
+	 * EVERY request - the admin included - so the finished restore was
+	 * unreachable. Only HTTP >= 500 counts as a failure: transport
+	 * errors mean "cannot tell" (loopback is not guaranteed) and must
+	 * never punish a plugin.
+	 *
+	 * @param array  $state Job state (for logging).
+	 * @param string $label What is being checked (plugin or phase).
+	 * @return bool|null True = serves, false = HTTP 5xx, null = unknown.
+	 */
+	protected static function site_boots( &$state, $label ) {
+		if ( ! function_exists( 'wp_remote_get' ) || ! function_exists( 'home_url' ) ) {
+			return null;
+		}
+		// admin-ajax is the cheapest full bootstrap: WordPress loads,
+		// plugins_loaded and init fire (where off-host plugins fatal),
+		// and there is no theme render. An unregistered action answers
+		// "0" with HTTP 200.
+		$url = function_exists( 'admin_url' ) ? admin_url( 'admin-ajax.php?action=uwp_none' ) : home_url( '/' );
+		$r   = wp_remote_get(
+			$url,
+			array(
+				'timeout'     => 5,
+				'blocking'    => true,
+				'cookies'     => array(),
+				'sslverify'   => false,
+				'redirection' => 2,
+			)
+		);
+		if ( is_wp_error( $r ) ) {
+			UWP_Helpers::debug_log( sprintf( 'import %s: boot check (%s) skipped: %s', $state['job_id'], $label, $r->get_error_message() ) );
+			return null;
+		}
+		$code = function_exists( 'wp_remote_retrieve_response_code' ) ? (int) wp_remote_retrieve_response_code( $r ) : 200;
+		if ( $code >= 500 ) {
+			UWP_Helpers::debug_log( sprintf( 'import %s: boot check (%s) FAILED: HTTP %d', $state['job_id'], $label, $code ) );
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Turn every plugin off except UnboundWP.
+	 *
+	 * The safe state after a restore that will not boot: the operator
+	 * can reach wp-admin and enable plugins one at a time, instead of
+	 * staring at a 500 page. Recorded as skipped so the completion
+	 * message lists exactly what is off.
+	 *
+	 * @param array  $state Job state (by reference; records skipped).
+	 * @param string $reason Human-readable cause, logged.
+	 * @return array Deactivated plugin basenames.
+	 */
+	protected static function quarantine_active_plugins( &$state, $reason ) {
+		if ( ! function_exists( 'deactivate_plugins' ) || ! function_exists( 'get_option' ) ) {
+			return array();
+		}
+		$active = get_option( 'active_plugins', array() );
+		if ( ! is_array( $active ) || empty( $active ) ) {
+			return array();
+		}
+		$off = array();
+		foreach ( $active as $plugin ) {
+			$plugin = ltrim( str_replace( '\\', '/', (string) $plugin ), '/' );
+			if ( '' === $plugin || $plugin === UWP_PLUGIN_BASENAME ) {
+				continue;
+			}
+			$off[] = $plugin;
+		}
+		if ( empty( $off ) ) {
+			return array();
+		}
+		deactivate_plugins( $off, true );
+		if ( function_exists( 'wp_cache_flush' ) ) {
+			wp_cache_flush();
+		}
+		self::reactivation_init( $state );
+		foreach ( $off as $plugin ) {
+			if ( ! in_array( $plugin, $state['reactivation']['skipped'], true ) ) {
+				$state['reactivation']['skipped'][] = $plugin;
+			}
+		}
+		UWP_Helpers::debug_log( sprintf( 'import %s: deactivated %d plugin(s): %s (%s)', $state['job_id'], UWP_Helpers::safe_count( $off ), implode( ', ', $off ), $reason ) );
+		return $off;
 	}
 
 	/**
@@ -2897,6 +3610,73 @@ class UWP_Import {
 			$state['react_index'] = 0;
 		}
 		$secure = function_exists( 'is_ssl' ) ? is_ssl() : false;
+		// Host-panel plugins restored as ACTIVE by the database step never
+		// reach activate_one_plugin()'s skip check, so turn them off here:
+		// they only work on their own host (off it they throw during
+		// plugins_loaded and every request - admin included - answers 500).
+		if ( ! isset( $state['react_host_purged'] ) ) {
+			$state['react_host_purged'] = true;
+			if ( function_exists( 'is_plugin_active' ) && function_exists( 'deactivate_plugins' ) ) {
+				foreach ( $list as $plugin ) {
+					$plugin = ltrim( str_replace( '\\', '/', (string) $plugin ), '/' );
+					if ( '' === $plugin || ! self::is_host_vendor_plugin( $plugin ) ) {
+						continue;
+					}
+					if ( is_plugin_active( $plugin ) ) {
+						deactivate_plugins( $plugin, true );
+						if ( ! in_array( $plugin, $state['reactivation']['skipped'], true ) ) {
+							$state['reactivation']['skipped'][] = $plugin;
+						}
+						UWP_Helpers::debug_log( sprintf( 'import %s: host-panel plugin %s deactivated (not portable off its host)', $state['job_id'], $plugin ) );
+					}
+				}
+				if ( function_exists( 'wp_cache_flush' ) ) {
+					wp_cache_flush();
+				}
+			}
+			self::save( $state );
+		}
+		// Before trusting the backup's plugin set: does the site boot with
+		// it? The database step restores active_plugins verbatim, so a
+		// host-panel plugin (valid on the source host only) can be live
+		// already and answer HTTP 500 on every request. Reactivating the
+		// rest would then be pointless - the admin and every tick 500 too.
+		// Quarantine the set instead: the operator gets a working site and
+		// enables plugins one at a time.
+		if ( ! array_key_exists( 'react_boot_ok', $state ) && (int) $state['react_index'] < UWP_Helpers::safe_count( $list ) ) {
+			$boots = self::site_boots( $state, 'baseline' );
+			$state['react_boot_ok'] = $boots;
+			self::save( $state );
+			if ( false === $boots ) {
+				$off   = self::quarantine_active_plugins( $state, 'the site did not boot with the backup\'s active plugins' );
+				$after = self::site_boots( $state, 'after quarantine' );
+				$state['react_boot_ok'] = $after;
+				// Nothing else gets activated in this run: the set is
+				// suspect until a human looks at it.
+				foreach ( $list as $plugin ) {
+					$plugin = ltrim( str_replace( '\\', '/', (string) $plugin ), '/' );
+					if ( '' !== $plugin && ! in_array( $plugin, $state['reactivation']['skipped'], true ) ) {
+						$state['reactivation']['skipped'][] = $plugin;
+					}
+				}
+				$state['react_index']   = UWP_Helpers::safe_count( $list );
+				$state['react_current'] = null;
+				$state['react_done']    = true;
+				self::core_note(
+					$state,
+					true === $after
+						? sprintf(
+							/* translators: 1: number of plugins, 2: comma-separated list */
+							__( 'The restored site returned HTTP 500 with the backup\'s plugins active, so %1$d plugin(s) were left inactive: %2$s. The site boots now - enable them one by one under Plugins.', 'unboundwp' ),
+							UWP_Helpers::safe_count( $off ),
+							implode( ', ', array_map( 'basename', $off ) )
+						)
+						: __( 'The restored site does not boot (HTTP 500) even with every plugin inactive. Check the server error log, the active theme, and the database connection.', 'unboundwp' )
+				);
+				self::save( $state );
+				return false;
+			}
+		}
 		while ( (int) $state['react_index'] < UWP_Helpers::safe_count( $list ) ) {
 			if ( $started > 0 && UWP_Helpers::out_of_time( $started ) ) {
 				return true;
@@ -2952,6 +3732,11 @@ class UWP_Import {
 		if ( '' === $plugin || $plugin === UWP_PLUGIN_BASENAME ) {
 			return null;
 		}
+		if ( self::is_host_vendor_plugin( $plugin ) ) {
+			// Only meaningful on its own hosting panel; off-host these
+			// read credentials that do not exist and fatal every request.
+			return 'skipped';
+		}
 		if ( ! $secure && self::is_risky_plugin( $plugin ) ) {
 			return 'skipped';
 		}
@@ -2979,6 +3764,21 @@ class UWP_Import {
 			$result = activate_plugin( $plugin, '', false, true );
 			if ( is_wp_error( $result ) ) {
 				throw new Exception( $result->get_error_message() );
+			}
+			// Activation only includes the main file; the plugin's real
+			// bootstrap runs on the NEXT request. Prove the site still
+			// serves before trusting the activation, and undo it when it
+			// does not (a host-panel plugin activated cleanly and then
+			// 500'd every request, admin included).
+			if ( true === ( array_key_exists( 'react_boot_ok', $state ) ? $state['react_boot_ok'] : null ) ) {
+				if ( false === self::site_boots( $state, $plugin ) ) {
+					self::fail_current_plugin(
+						$state,
+						$plugin,
+						__( 'the site returned HTTP 500 once it was active, so it was deactivated again', 'unboundwp' )
+					);
+					return 'failed';
+				}
 			}
 			return 'activated';
 		} catch ( Throwable $e ) {

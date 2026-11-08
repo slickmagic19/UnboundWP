@@ -33,9 +33,11 @@ class UWP_Diag {
 		$probes = array(
 			'php'       => 'PHP runtime',
 			'functions' => 'Required functions',
+			'limits'    => 'Server limits & free space',
 			'temp'      => 'Temp/backups directories',
 			'state'     => 'Job state save/load',
 			'lock'      => 'Job locking',
+			'archive'   => 'Archive write/read roundtrip',
 			'scan'      => 'Directory streaming sample',
 			'database'  => 'Database basics',
 			'uploads'   => 'Uploads directory',
@@ -105,6 +107,87 @@ class UWP_Diag {
 			return array( false, 'missing: ' . implode( ', ', $missing ) );
 		}
 		return array( true, 'flock, random_bytes, hash, zlib, openssl, HTTP API present' );
+	}
+
+	protected static function probe_limits() {
+		$free  = UWP_Helpers::disk_free_bytes( uwp_temp_dir() );
+		$packet = 0;
+		global $wpdb;
+		if ( isset( $wpdb ) && method_exists( $wpdb, 'get_row' ) ) {
+			$row = $wpdb->get_row( "SHOW VARIABLES LIKE 'max_allowed_packet'", ARRAY_N ); // phpcs:ignore
+			$packet = ( is_array( $row ) && isset( $row[1] ) ) ? (int) $row[1] : 0;
+		}
+		return array(
+			true,
+			sprintf(
+				'PHP time limit %s, memory %s, upload_max_filesize %s, post_max_size %s, free space %s, max_allowed_packet %s. Uploads are sliced and jobs resume, so these limits do not cap backup size.',
+				(string) ini_get( 'max_execution_time' ),
+				(string) ini_get( 'memory_limit' ),
+				(string) ini_get( 'upload_max_filesize' ),
+				(string) ini_get( 'post_max_size' ),
+				( false === $free ) ? 'unknown' : size_format( $free ),
+				$packet > 0 ? size_format( $packet ) : 'unknown'
+			),
+		);
+	}
+
+	/**
+	 * Write a small archive, read it back, verify header + CRC + bytes.
+	 *
+	 * This is the strongest single probe: it exercises the exact writer
+	 * and reader used by real backups (including checksum backpatching),
+	 * so a broken filesystem or hash extension is named here instead of
+	 * surfacing as a mysteriously unreadable backup later.
+	 */
+	protected static function probe_archive() {
+		$dir = uwp_temp_dir();
+		if ( ! is_dir( $dir ) ) {
+			return array( false, 'temp dir unavailable' );
+		}
+		$src = $dir . 'diag-src-' . bin2hex( random_bytes( 4 ) ) . '.bin';
+		$arc = $dir . 'diag-arc-' . bin2hex( random_bytes( 4 ) ) . '.uwp';
+		$payload = str_repeat( "UnboundWP archive roundtrip probe\n", 2048 ); // ~64 KB.
+		if ( false === @file_put_contents( $src, $payload ) ) { // phpcs:ignore
+			return array( false, 'cannot write probe source' );
+		}
+		$ok    = false;
+		$error = '';
+		try {
+			$out = UWP_Archive::open_for_write( $arc );
+			UWP_Archive::append_file( $out, $src, '.', 'probe.bin' );
+			UWP_Archive::finish( $out );
+
+			$in    = @fopen( $arc, 'rb' ); // phpcs:ignore
+			$entry = ( false === $in ) ? null : UWP_Archive::read_header( $in );
+			if ( null === $entry ) {
+				$error = 'header not readable';
+			} elseif ( (int) $entry['size'] !== strlen( $payload ) ) {
+				$error = 'size mismatch (' . (int) $entry['size'] . ')';
+			} elseif ( '' !== $entry['crc'] && strtolower( $entry['crc'] ) !== strtolower( hash( 'crc32b', $payload ) ) ) {
+				$error = 'checksum not backpatched correctly';
+			} else {
+				$tmp = fopen( 'php://temp', 'r+b' ); // phpcs:ignore
+				UWP_Archive::copy_data( $in, $tmp, $entry );
+				rewind( $tmp );
+				$read = stream_get_contents( $tmp );
+				fclose( $tmp );
+				$ok = ( $read === $payload );
+				if ( ! $ok ) {
+					$error = 'data mismatch after read-back';
+				}
+			}
+			if ( is_resource( $in ) ) {
+				fclose( $in );
+			}
+		} catch ( Throwable $e ) {
+			$error = $e->getMessage();
+		}
+		@unlink( $src ); // phpcs:ignore
+		@unlink( $arc ); // phpcs:ignore
+		if ( ! $ok ) {
+			return array( false, 'roundtrip failed: ' . $error );
+		}
+		return array( true, 'wrote, checksummed and read back 64 KB; per-file CRC backpatch works' );
 	}
 
 	protected static function probe_temp() {
@@ -486,9 +569,17 @@ class UWP_Diag {
 		$h     = @opendir( $tmp ); // phpcs:ignore
 		if ( false !== $h ) {
 			while ( false !== ( $e = readdir( $h ) ) ) {
-				if ( 0 === strpos( $e, 'state-' ) && '.json' === substr( $e, -5 ) ) {
-					$found[] = $e;
+				if ( 0 !== strpos( $e, 'state-' ) || '.json' !== substr( $e, -5 ) ) {
+					continue;
 				}
+				$raw  = @file_get_contents( $tmp . DIRECTORY_SEPARATOR . $e ); // phpcs:ignore
+				$data = $raw ? json_decode( $raw, true ) : null;
+				// Completed jobs keep their state for debugging - that is
+				// not a stuck job. Only unfinished ones are reported.
+				if ( is_array( $data ) && ! empty( $data['done'] ) ) {
+					continue;
+				}
+				$found[] = $e;
 			}
 			closedir( $h );
 		}

@@ -110,8 +110,13 @@ class UWP_Database {
 			// phpcs:ignore -- internal table name from SHOW TABLES.
 			$create = $wpdb->get_row( "SHOW CREATE TABLE `{$table}`", ARRAY_N );
 			if ( ! empty( $create[1] ) ) {
-				self::fwrite_all( $out, "DROP TABLE IF EXISTS `{$table}`;\n" );
+				// Views must be recreated as views: DROP TABLE against a
+				// view errors out and leaves the stale definition behind.
+				$is_view = (bool) preg_match( '/^\s*CREATE\b[\s\S]*?\bVIEW\b/i', (string) $create[1] );
+				self::fwrite_all( $out, ( $is_view ? "DROP VIEW IF EXISTS `{$table}`;\n" : "DROP TABLE IF EXISTS `{$table}`;\n" ) );
 				self::fwrite_all( $out, $create[1] . ";\n" );
+			} else {
+				UWP_Helpers::debug_log( sprintf( 'dump: WARNING: SHOW CREATE TABLE failed for %s (%s)', $table, (string) $wpdb->last_error ) );
 			}
 			$state['wrote_create'] = true;
 			// Decide pagination once per table: keyset on a single-column
@@ -213,109 +218,143 @@ class UWP_Database {
 	/**
 	 * Import database.sql the way All-in-One WP Migration does it.
 	 *
-	 * - Streams the file line by line (fgets) and executes each complete
+	 * - Streams the file in 64 KB chunks and executes each complete
 	 *   statement - memory stays flat no matter how big the dump is.
-	 * - Resumes by exact byte offset (ftell), persisted between ticks.
+	 * - Resumes by exact byte offset, persisted between ticks.
 	 * - Runs inside START TRANSACTION … COMMIT per call, so a dying tick
 	 *   rolls back instead of leaving half-written tables.
 	 * - Skips volatile junk (transients, WooCommerce / importer sessions)
 	 *   instead of restoring stale cache rows.
 	 * - Honors max_allowed_packet: oversized statements are skipped, never
 	 *   fatal.
-	 * - Timeout-checked after every statement (10s budget), EXCEPT for
+	 * - Timeout-checked after every statement (adaptive budget), EXCEPT for
 	 *   atomic statements (DROP/CREATE and wp_options writes) which always
 	 *   run to completion - the options table can never be left half-done.
 	 *
-	 * State: offset (byte position in the SQL file).
+	 * Statement parsing is quote/comment/delimiter aware (see
+	 * next_statement()): multi-line statements, ';' inside values and
+	 * `DELIMITER $$` routine dumps all import correctly. The old
+	 * "line ending with ;" heuristic silently cut rows whose text
+	 * contained a newline.
+	 *
+	 * State: offset (byte position in the SQL file), delimiter.
 	 *
 	 * @param string $sql_path Absolute database.sql path.
 	 * @param array  $state Import state (by reference).
 	 * @return bool True when the whole file has been imported.
+	 * @throws Exception On unrecoverable database errors.
 	 */
 	public static function import_tick( $sql_path, &$state ) {
 		global $wpdb;
 
-		$size = filesize( $sql_path );
-		if ( ! isset( $state['offset'] ) ) {
+		if ( ! is_string( $sql_path ) || '' === $sql_path || ! is_file( $sql_path ) ) {
+			throw new Exception( __( 'database.sql is missing from the backup.', 'unboundwp' ) );
+		}
+		$size = (int) filesize( $sql_path );
+		if ( ! isset( $state['offset'] ) || ! is_numeric( $state['offset'] ) ) {
 			$state['offset'] = 0;
 		}
+		$state['offset'] = max( 0, (int) $state['offset'] );
 		if ( $state['offset'] >= $size ) {
 			return true;
 		}
 
 		$started      = microtime( true );
-		$time_budget  = 10; // seconds of DB work per call (Ai1WM parity).
+		$deadline     = $started + UWP_Helpers::time_budget();
 		$max_packet   = self::max_allowed_packet();
 		$options_mark = 'INSERT INTO `' . $wpdb->prefix . 'options`';
+		$delimiter    = ( isset( $state['delimiter'] ) && is_string( $state['delimiter'] ) && '' !== $state['delimiter'] )
+			? $state['delimiter']
+			: ';';
 
 		$handle = @fopen( $sql_path, 'rb' ); // phpcs:ignore
 		if ( false === $handle ) {
 			throw new Exception( __( 'Cannot open database.sql for import.', 'unboundwp' ) );
 		}
-		fseek( $handle, (int) $state['offset'] );
+		if ( 0 !== fseek( $handle, (int) $state['offset'] ) ) {
+			fclose( $handle );
+			throw new Exception( __( 'Cannot seek inside database.sql.', 'unboundwp' ) );
+		}
 
 		// Per-request session settings, like Ai1WM.
 		$wpdb->query( "SET SESSION sql_mode = ''" ); // phpcs:ignore
 		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore (no-op on MyISAM).
 
-		$query     = null;
-		$completed = true;
-		$in_block  = false; // inside a multi-line /* … */ comment.
+		$buffer    = '';                       // bytes read but not consumed yet
+		$read_pos  = (int) $state['offset'];   // file position after the buffer
+		$eof       = false;
+		$running   = true;
+		$last_err  = '';
+		$skipped   = 0;
 
-		while ( ( $line = fgets( $handle ) ) !== false ) {
-			// Strip comment-only lines BEFORE accumulating, so a bare
-			// comment line can never glue itself to the next statement
-			// (which would silently swallow e.g. a DROP TABLE).
-			// Executable MySQL conditionals (/*!…*/) are kept.
-			if ( $in_block ) {
-				if ( false !== strpos( $line, '*/' ) ) {
-					$in_block = false;
+		while ( $running ) {
+			if ( microtime( true ) >= $deadline || UWP_Helpers::memory_hot() ) {
+				break;
+			}
+
+			// MySQL-client directive: switch the statement terminator.
+			if ( preg_match( '/^\s*DELIMITER\s+(\S+)[^\n]*\n/i', $buffer, $dm ) ) {
+				$delimiter = $dm[1];
+				$buffer    = substr( $buffer, strlen( $dm[0] ) );
+				$state['delimiter'] = $delimiter;
+				$state['offset']    = $read_pos - strlen( $buffer );
+				continue;
+			}
+
+			$next = self::next_statement( $buffer, $delimiter );
+			if ( null === $next['sql'] ) {
+				if ( $eof ) {
+					// Trailing bytes with no terminator: a truncated dump.
+					// Executing a partial statement would only error out,
+					// so report it and finish - every complete statement
+					// before it has already landed.
+					if ( '' !== trim( $buffer ) ) {
+						UWP_Helpers::debug_log( sprintf( 'import: dump ends with an unterminated statement (%d bytes), skipped', strlen( trim( $buffer ) ) ) );
+						$state['unterminated_tail'] = true;
+					}
+					$state['offset'] = $size;
+					$buffer = '';
+					break;
 				}
-				$state['offset'] = ftell( $handle );
-				continue;
-			}
-			$trimmed = ltrim( $line );
-			if ( '' === $trimmed ) {
-				$state['offset'] = ftell( $handle );
-				continue;
-			}
-			if ( 0 === strpos( $trimmed, '--' ) || '#' === $trimmed[0] ) {
-				$state['offset'] = ftell( $handle );
-				continue;
-			}
-			if ( 0 === strpos( $trimmed, '/*' ) && 0 !== strpos( $trimmed, '/*!' ) ) {
-				if ( false === strpos( $trimmed, '*/' ) ) {
-					$in_block = true;
+				$chunk = fread( $handle, 65536 ); // phpcs:ignore
+				if ( false === $chunk || '' === $chunk ) {
+					$eof = true;
+					continue;
 				}
-				$state['offset'] = ftell( $handle );
+				$buffer   .= $chunk;
+				$read_pos += strlen( $chunk );
+
+				// A single statement bigger than max_allowed_packet can
+				// never execute on this server. Drop it (and resync on a
+				// line boundary) instead of growing memory forever.
+				if ( strlen( $buffer ) > $max_packet ) {
+					$cut = strpos( $buffer, $delimiter );
+					if ( false === $cut ) {
+						$nl  = strrpos( $buffer, "\n" );
+						$cut = ( false === $nl ) ? strlen( $buffer ) - 1 : $nl;
+					}
+					$buffer = substr( $buffer, $cut + strlen( $delimiter ) );
+					$state['offset'] = $read_pos - strlen( $buffer );
+					$skipped++;
+					UWP_Helpers::debug_log( sprintf( 'import: skipped an oversized statement (> %d bytes)', $max_packet ) );
+				}
 				continue;
 			}
 
-			$query .= $line;
+			$sql    = $next['sql'];
+			$buffer = $next['rest'];
 
-			// End of statement: semicolon at end of line. Our own dumper
-			// and Ai1WM dumps both write one statement per line.
-			if ( ! preg_match( '/;\s*$/S', $query ) ) {
-				continue;
-			}
-			$sql   = trim( $query );
-			$query = null;
-
-			if ( '' === $sql || 0 === strpos( $sql, '--' ) || 0 === strpos( $sql, '/*' ) ) {
-				$state['offset'] = ftell( $handle );
+			$trimmed = trim( (string) $sql );
+			if ( '' === $trimmed || self::is_comment_only( $trimmed ) ) {
+				$state['offset'] = $read_pos - strlen( $buffer );
 				continue;
 			}
 			if ( strlen( $sql ) > $max_packet ) {
 				// Too big for this server - skip, never die.
 				UWP_Helpers::debug_log( sprintf( 'import: skipped oversized statement (%d bytes)', strlen( $sql ) ) );
-				$state['offset'] = ftell( $handle );
+				$state['offset'] = $read_pos - strlen( $buffer );
 				continue;
 			}
-			if ( self::is_skippable_insert( $sql ) ) {
-				$state['offset'] = ftell( $handle );
-				continue;
-			}
-
 			// Table-prefix remap (dump → live), done in the data: statement
 			// identifiers plus option_name/meta_key values only - never row
 			// DATA, so serialized lengths stay valid by construction.
@@ -325,9 +364,50 @@ class UWP_Database {
 				$sql = self::rewrite_statement_prefix( $sql, $from_pfx, $to_pfx );
 			}
 
+			// Volatile rows are detected AFTER the remap (the check keys on
+			// the live table name) and only for options INSERTs.
+			if ( self::is_skippable_insert( $sql ) ) {
+				$state['offset'] = $read_pos - strlen( $buffer );
+				continue;
+			}
+
+			// Dumps from another server can carry collations/charsets this
+			// one has never heard of (classic: MariaDB 11's
+			// utf8mb3_uca1400_ai_ci imported into MySQL 8). Normalize them
+			// before the statement runs, or every such table fails to exist.
+			if ( self::is_schema_statement( $sql ) ) {
+				$sql = self::normalize_ddl_collations( $sql, $state );
+			}
+
 			// phpcs:ignore -- SQL comes from the backup itself.
-			$result = $wpdb->query( $sql );
+			// Hide wpdb's HTML "WordPress database error" output while the
+			// statement runs: a printed error would corrupt the JSON answer
+			// of the AJAX tick. last_error is still readable for our own
+			// reporting, and suppression is restored immediately.
+			$prev_suppress = $wpdb->suppress_errors( true );
+			try {
+				$result = $wpdb->query( $sql ); // phpcs:ignore
+			} finally {
+				$wpdb->suppress_errors( $prev_suppress );
+			}
 			if ( false === $result && '' !== $wpdb->last_error ) {
+				$db_error = (string) $wpdb->last_error;
+
+				// A schema statement that fails is NEVER "keep going": the
+				// dump already dropped the old table, so continuing would
+				// finish with a missing table and call it a success. Stop
+				// with the real reason instead (resumable).
+				if ( self::is_schema_statement( $sql ) ) {
+					throw new Exception(
+						sprintf(
+							/* translators: 1: server error, 2: statement excerpt */
+							__( 'The database server rejected a schema statement: %1$s This usually means the backup was made with database features this server lacks (a charset, collation or table engine). The restore stopped here; completed steps are saved, so fix the server (or restore on a compatible one) and press Resume. Statement: %2$s', 'unboundwp' ),
+							$db_error,
+							substr( preg_replace( '/\s+/', ' ', $sql ), 0, 200 )
+						)
+					);
+				}
+
 				// Duplicate-key convergence: a concurrent writer (or a
 				// replayed batch after a hard death) may have put a row
 				// with the same unique key first - most often fresh
@@ -335,12 +415,13 @@ class UWP_Database {
 				// the STALE row and silently lose the dump's data, so
 				// retry once as REPLACE INTO: the dump's row wins, whatever
 				// the conflicting key is. Verbatim values, no parsing.
-				if ( false !== stripos( $wpdb->last_error, 'Duplicate entry' )
+				if ( false !== stripos( $db_error, 'Duplicate entry' )
 					&& 0 === stripos( ltrim( $sql ), 'INSERT INTO' ) ) {
 					$retry_sql = preg_replace( '/^INSERT INTO/i', 'REPLACE INTO', ltrim( $sql ), 1 );
 					$retry     = ( null !== $retry_sql ) ? $wpdb->query( $retry_sql ) : false; // phpcs:ignore
 					if ( false === $retry && '' !== $wpdb->last_error ) {
 						self::maybe_throw_db_error( $wpdb->last_error );
+						self::record_db_error( $state, (string) $wpdb->last_error, $sql );
 					} elseif ( false !== $retry ) {
 						if ( ! isset( $state['dupe_fixes'] ) ) {
 							$state['dupe_fixes'] = 0;
@@ -351,40 +432,361 @@ class UWP_Database {
 						}
 					}
 				} else {
-					self::maybe_throw_db_error( $wpdb->last_error );
+					self::maybe_throw_db_error( $db_error );
+					// Row-level failures (a value too long, an old clause)
+					// are recorded and reported at the end instead of being
+					// silently swallowed.
+					self::record_db_error( $state, $db_error, $sql );
 				}
-				// Other failures (e.g. version-specific clauses): keep going.
 			}
 
-			$state['offset'] = ftell( $handle );
+			if ( ! isset( $state['statements'] ) ) {
+				$state['statements'] = 0;
+			}
+			$state['statements'] = (int) $state['statements'] + 1;
+			$state['offset']     = $read_pos - strlen( $buffer );
 
 			// Time check after every statement - except atomic ones, which
-			// must complete so tables are never left half-written. Memory
-			// is checked too: breaking to a tick boundary beats dying to
-			// an out-of-memory fatal mid-batch (the COMMIT below still runs).
+			// must complete so tables are never left half-written.
 			if ( ! self::is_atomic_statement( $sql, $options_mark ) ) {
-				if ( ( microtime( true ) - $started ) > $time_budget || UWP_Helpers::memory_hot() ) {
-					$completed = false;
+				if ( microtime( true ) > $deadline || UWP_Helpers::memory_hot() ) {
+					$running = false;
 					break;
 				}
 			}
 		}
 
+		if ( '' !== $last_err && ! isset( $state['last_error'] ) ) {
+			$state['last_error'] = substr( $last_err, 0, 300 );
+		}
+		if ( $skipped > 0 ) {
+			$state['oversized_skipped'] = ( isset( $state['oversized_skipped'] ) ? (int) $state['oversized_skipped'] : 0 ) + $skipped;
+		}
+
 		$wpdb->query( 'COMMIT' ); // phpcs:ignore
-		$eof = feof( $handle );
+		$done = $eof && '' === trim( $buffer );
 		fclose( $handle );
-		return $completed && $eof;
+		if ( $done && ! isset( $state['offset'] ) ) {
+			$state['offset'] = $size;
+		}
+		return $done;
+	}
+
+	/**
+	 * Pull one complete statement out of a buffer.
+	 *
+	 * Quote, comment and delimiter aware. Returns sql = null when the
+	 * buffer does not contain a complete statement yet (caller reads
+	 * more), so a statement may span any number of reads.
+	 *
+	 * Handles: 'single', "double", `backtick` (with '' / "" / `` doubling
+	 * and backslash escapes), -- and # line comments, block comments
+	 * (including executable /*! … *\/ which stay part of the statement),
+	 * and arbitrary DELIMITER strings.
+	 *
+	 * @param string $buffer Pending bytes.
+	 * @param string $delimiter Statement terminator.
+	 * @return array{sql:string|null,rest:string}
+	 */
+	public static function next_statement( $buffer, $delimiter = ';' ) {
+		$buffer = (string) $buffer;
+		$delim   = ( is_string( $delimiter ) && '' !== $delimiter ) ? $delimiter : ';';
+		$dlen    = strlen( $delim );
+		$len     = strlen( $buffer );
+		$state   = 'code'; // code | sq | dq | bt | line | block.
+		$start   = 0;
+
+		for ( $i = 0; $i < $len; $i++ ) {
+			$ch = $buffer[ $i ];
+
+			if ( 'line' === $state ) {
+				if ( "\n" === $ch ) {
+					$state = 'code';
+				}
+				continue;
+			}
+			if ( 'block' === $state ) {
+				if ( '*' === $ch && $i + 1 < $len && '/' === $buffer[ $i + 1 ] ) {
+					$state = 'code';
+					$i++;
+				}
+				continue;
+			}
+			if ( 'sq' === $state || 'dq' === $state ) {
+				$quote = ( 'sq' === $state ) ? "'" : '"';
+				if ( '\\' === $ch ) {
+					$i++; // escape consumes the next byte (whatever it is).
+					continue;
+				}
+				if ( $ch === $quote ) {
+					if ( $i + 1 < $len && $buffer[ $i + 1 ] === $quote ) {
+						$i++; // doubled quote = literal quote, string continues.
+					} else {
+						$state = 'code';
+					}
+				}
+				continue;
+			}
+			if ( 'bt' === $state ) {
+				if ( '`' === $ch ) {
+					if ( $i + 1 < $len && '`' === $buffer[ $i + 1 ] ) {
+						$i++;
+					} else {
+						$state = 'code';
+					}
+				}
+				continue;
+			}
+
+			// Normal code.
+			if ( "'" === $ch ) {
+				$state = 'sq';
+				continue;
+			}
+			if ( '"' === $ch ) {
+				$state = 'dq';
+				continue;
+			}
+			if ( '`' === $ch ) {
+				$state = 'bt';
+				continue;
+			}
+			if ( '#' === $ch ) {
+				$state = 'line';
+				continue;
+			}
+			if ( '-' === $ch && $i + 1 < $len && '-' === $buffer[ $i + 1 ]
+				&& ( $i + 2 >= $len || false !== strpos( " \t\r\n", $buffer[ $i + 2 ] ) ) ) {
+				$state = 'line';
+				$i++;
+				continue;
+			}
+			if ( '/' === $ch && $i + 1 < $len && '*' === $buffer[ $i + 1 ] ) {
+				$state = 'block';
+				$i++;
+				continue;
+			}
+			if ( $dlen > 0 && $ch === $delim[0] && substr( $buffer, $i, $dlen ) === $delim ) {
+				return array(
+					'sql'  => substr( $buffer, $start, $i - $start + $dlen ),
+					'rest' => substr( $buffer, $i + $dlen ),
+				);
+			}
+		}
+
+		return array( 'sql' => null, 'rest' => $buffer );
+	}
+
+	/**
+	 * Whether a statement holds only comments/whitespace (nothing to run).
+	 *
+	 * @param string $sql Trimmed statement.
+	 * @return bool
+	 */
+	protected static function is_comment_only( $sql ) {
+		$probe = (string) $sql;
+		// `/*!` is executable MySQL code - never treat it as a comment.
+		while ( preg_match( '/^\s*(?:--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|\/\*(?!!)[\s\S]*?\*\/)/', $probe, $m ) ) {
+			$probe = substr( $probe, strlen( $m[0] ) );
+			if ( '' === trim( $probe ) ) {
+				return true;
+			}
+		}
+		return '' === trim( $probe );
+	}
+
+	/**
+	 * Whether a statement changes schema (and therefore must never be
+	 * silently skipped when it fails).
+	 *
+	 * @param string $sql Statement.
+	 * @return bool
+	 */
+	public static function is_schema_statement( $sql ) {
+		return (bool) preg_match( '/^\s*(DROP|CREATE|ALTER|RENAME|TRUNCATE)\b/i', (string) $sql );
+	}
+
+	/**
+	 * Collations this database server knows, keyed by lowercase name.
+	 *
+	 * Cached per request. An empty array means "could not ask", in which
+	 * case nothing is rewritten (never guess when unsure).
+	 *
+	 * @return array collation => charset
+	 */
+	protected static function supported_collations() {
+		static $set = null;
+		if ( null !== $set ) {
+			return $set;
+		}
+		global $wpdb;
+		$set  = array();
+		$rows = $wpdb->get_results( 'SHOW COLLATION', ARRAY_A ); // phpcs:ignore
+		if ( is_array( $rows ) ) {
+			foreach ( $rows as $row ) {
+				if ( empty( $row['Collation'] ) ) {
+					continue;
+				}
+				$set[ strtolower( (string) $row['Collation'] ) ] = isset( $row['Charset'] ) ? strtolower( (string) $row['Charset'] ) : '';
+			}
+		}
+		return $set;
+	}
+
+	/**
+	 * A collation this server supports, for the same character set.
+	 *
+	 * @param string $collation Original (unsupported) collation name.
+	 * @param array  $supported Supported collation map.
+	 * @return string|null Replacement, or null to drop the COLLATE clause.
+	 */
+	protected static function fallback_collation( $collation, $supported ) {
+		$charset = (string) $collation;
+		$pos     = strpos( $charset, '_' );
+		if ( false !== $pos ) {
+			$charset = substr( $charset, 0, $pos );
+		}
+		$charsets = array();
+		foreach ( $supported as $cs ) {
+			if ( '' !== $cs ) {
+				$charsets[ $cs ] = true;
+			}
+		}
+		// utf8mb3 and utf8 are the same thing under two names; use the one
+		// this server actually exposes.
+		$map = array( 'utf8mb3' => 'utf8', 'utf8' => 'utf8mb3' );
+		if ( ! isset( $charsets[ $charset ] ) && isset( $map[ $charset ], $charsets[ $map[ $charset ] ] ) ) {
+			$charset = $map[ $charset ];
+		}
+		if ( ! isset( $charsets[ $charset ] ) ) {
+			return null; // unknown charset: let the charset default decide.
+		}
+		$candidates = array(
+			$charset . '_unicode_ci',
+			$charset . '_general_ci',
+			$charset . '_general_mysql500_ci',
+			$charset . '_bin',
+		);
+		foreach ( $candidates as $candidate ) {
+			if ( isset( $supported[ $candidate ] ) ) {
+				return $candidate;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Replace charsets/collations this server does not support.
+	 *
+	 * Backups move between database servers: a MariaDB 11 site dumps
+	 * `utf8mb3_uca1400_ai_ci` (and sometimes `utf8mb3`), which MySQL 8
+	 * rejects outright - every such CREATE TABLE would fail. Map them to
+	 * the closest supported equivalent (same character set) or drop the
+	 * clause and let the table default apply.
+	 *
+	 * @param string $sql    DDL statement.
+	 * @param array  $state  Import db_state (by reference; counts fixes).
+	 * @return string Possibly-rewritten statement.
+	 */
+	public static function normalize_ddl_collations( $sql, &$state = null ) {
+		$supported = self::supported_collations();
+		if ( empty( $supported ) ) {
+			return $sql;
+		}
+		$charsets = array();
+		foreach ( $supported as $cs ) {
+			if ( '' !== $cs ) {
+				$charsets[ $cs ] = true;
+			}
+		}
+		$fixes = 0;
+
+		// CHARSET=utf8mb3 / CHARACTER SET utf8mb3 (table and column level).
+		$sql = preg_replace_callback(
+			'/\b(CHARSET|CHARACTER)(\s+SET)?(\s*=\s*|\s+)([A-Za-z0-9_]+)/i',
+			function ( $m ) use ( $charsets, &$fixes ) {
+				$cs = strtolower( $m[4] );
+				if ( isset( $charsets[ $cs ] ) ) {
+					return $m[0];
+				}
+				$map = array( 'utf8mb3' => 'utf8', 'utf8' => 'utf8mb3' );
+				if ( isset( $map[ $cs ] ) && isset( $charsets[ $map[ $cs ] ] ) ) {
+					$fixes++;
+					return $m[1] . ( '' !== $m[2] ? $m[2] : '' ) . $m[3] . $map[ $cs ];
+				}
+				return $m[0];
+			},
+			$sql
+		);
+
+		// COLLATE=utf8mb3_uca1400_ai_ci / COLLATE utf8mb4_... (both forms).
+		$sql = preg_replace_callback(
+			'/\bCOLLATE(\s*=\s*|\s+)([A-Za-z0-9_]+)/i',
+			function ( $m ) use ( $supported, &$fixes ) {
+				$col = strtolower( $m[2] );
+				if ( isset( $supported[ $col ] ) ) {
+					return $m[0];
+				}
+				$fallback = self::fallback_collation( $col, $supported );
+				$fixes++;
+				if ( null === $fallback ) {
+					return ''; // drop it: the charset default is valid.
+				}
+				return 'COLLATE' . $m[1] . $fallback;
+			},
+			$sql
+		);
+
+		if ( $fixes > 0 && is_array( $state ) ) {
+			$state['collation_fixes'] = ( isset( $state['collation_fixes'] ) ? (int) $state['collation_fixes'] : 0 ) + $fixes;
+			if ( (int) $state['collation_fixes'] === $fixes ) { // first time only.
+				UWP_Helpers::debug_log( sprintf( 'import: normalized %d unsupported charset/collation clause(s) for this database server', $fixes ) );
+			}
+		}
+		return $sql;
+	}
+
+	/**
+	 * Record a row-level database failure (bounded, human-readable).
+	 *
+	 * @param array  $state Import db_state (by reference).
+	 * @param string $error Server error text.
+	 * @param string $sql   Statement that failed.
+	 */
+	protected static function record_db_error( &$state, $error, $sql ) {
+		if ( ! is_array( $state ) ) {
+			return;
+		}
+		if ( ! isset( $state['db_errors'] ) || ! is_array( $state['db_errors'] ) ) {
+			$state['db_errors'] = array();
+		}
+		$state['db_error_count'] = ( isset( $state['db_error_count'] ) ? (int) $state['db_error_count'] : 0 ) + 1;
+		if ( UWP_Helpers::safe_count( $state['db_errors'] ) < 5 ) {
+			$state['db_errors'][] = substr( (string) $error, 0, 200 ) . ' [' . substr( preg_replace( '/\s+/', ' ', trim( (string) $sql ) ), 0, 90 ) . ']';
+		}
+		if ( (int) $state['db_error_count'] <= 5 ) {
+			UWP_Helpers::debug_log( sprintf( 'import: database statement failed (%d): %s', (int) $state['db_error_count'], (string) $error ) );
+		}
 	}
 
 	/**
 	 * Skip volatile rows that must never be restored: transients and
-	 * session tables (WooCommerce, WP All Import). Restoring them only
+	 * session options (WooCommerce, WP All Import). Restoring them only
 	 * brings back stale cache locks and dead sessions.
+	 *
+	 * Deliberately scoped to INSERTs into the options table: the old
+	 * whole-statement match also skipped posts whose CONTENT happened to
+	 * contain "_transient_" - silent data loss.
 	 *
 	 * @param string $sql Complete statement.
 	 * @return bool
 	 */
 	protected static function is_skippable_insert( $sql ) {
+		global $wpdb;
+		$prefix = ( isset( $wpdb->prefix ) && is_string( $wpdb->prefix ) ) ? $wpdb->prefix : 'wp_';
+		if ( ! preg_match( '/^\s*INSERT\s+INTO\s+`?' . preg_quote( $prefix . 'options', '/' ) . '`?\s*\(/i', (string) $sql ) ) {
+			return false;
+		}
 		return false !== strpos( $sql, "'_transient_" )
 			|| false !== strpos( $sql, "'_site_transient_" )
 			|| false !== strpos( $sql, "'_wc_session_" )
@@ -488,7 +890,11 @@ class UWP_Database {
 	 * Rewrite the option_name / meta_key value inside an options/usermeta
 	 * INSERT (already mapped to live table names). Positional parse of the
 	 * column list finds the key column; only that literal is remapped.
-	 * Multi-tuple or unparseable statements are returned unchanged.
+	 *
+	 * Every VALUES tuple is handled, so extended-insert dumps
+	 * (`INSERT … VALUES (...),(...),(...)`, what mysqldump writes by
+	 * default) restore their prefixed option/meta keys correctly too.
+	 * Unparseable statements are returned unchanged.
 	 *
 	 * @param string $sql Complete INSERT statement (live table names).
 	 * @param string $from Dump prefix.
@@ -528,33 +934,46 @@ class UWP_Database {
 		if ( $idx < 0 ) {
 			return $sql;
 		}
-		// VALUES group must be single-tuple; anything else: leave untouched.
 		$values_pos = stripos( $sql, 'VALUES', $close );
 		if ( false === $values_pos ) {
 			return $sql;
 		}
-		$vopen = strpos( $sql, '(', $values_pos );
-		if ( false === $vopen ) {
+
+		// Walk every tuple; collect literal edits, then apply them from the
+		// end so earlier offsets stay valid.
+		$len   = strlen( $sql );
+		$pos   = $values_pos;
+		$edits = array();
+		while ( false !== ( $vopen = strpos( $sql, '(', $pos ) ) ) {
+			$vals = self::split_sql_tuple( $sql, $vopen );
+			if ( null === $vals || UWP_Helpers::safe_count( $vals['items'] ) !== UWP_Helpers::safe_count( $cols ) ) {
+				break;
+			}
+			if ( isset( $vals['items'][ $idx ] ) ) {
+				$new_literal = self::remap_key_literal( $vals['items'][ $idx ], $from, $to );
+				if ( null !== $new_literal ) {
+					$edits[] = array( (int) $vals['starts'][ $idx ], (int) $vals['ends'][ $idx ], $new_literal );
+				}
+			}
+			// Continue only when another tuple follows this one.
+			$pos = (int) $vals['end'] + 1;
+			while ( $pos < $len && false !== strpos( " \t\r\n", $sql[ $pos ] ) ) {
+				$pos++;
+			}
+			if ( $pos >= $len || ',' !== $sql[ $pos ] ) {
+				break;
+			}
+			$pos++;
+		}
+
+		if ( empty( $edits ) ) {
 			return $sql;
 		}
-		$vals = self::split_sql_tuple( $sql, $vopen );
-		if ( null === $vals || UWP_Helpers::safe_count( $vals['items'] ) !== UWP_Helpers::safe_count( $cols ) ) {
-			return $sql;
+		for ( $i = count( $edits ) - 1; $i >= 0; $i-- ) {
+			list( $s, $e, $lit ) = $edits[ $i ];
+			$sql = substr( $sql, 0, $s ) . $lit . substr( $sql, $e );
 		}
-		// Ensure no second tuple follows (multi-row INSERT): anything but
-		// whitespace/semicolon after the tuple means hands off.
-		$tail = trim( substr( $sql, $vals['end'] + 1 ), " \t\n\r;" );
-		if ( '' !== $tail ) {
-			return $sql;
-		}
-		if ( ! isset( $vals['items'][ $idx ] ) ) {
-			return $sql;
-		}
-		$new_literal = self::remap_key_literal( $vals['items'][ $idx ], $from, $to );
-		if ( null === $new_literal ) {
-			return $sql;
-		}
-		return substr( $sql, 0, $vals['starts'][ $idx ] ) . $new_literal . substr( $sql, $vals['ends'][ $idx ] );
+		return $sql;
 	}
 
 	/**
@@ -692,8 +1111,11 @@ class UWP_Database {
 	 * @throws Exception
 	 */
 	protected static function maybe_throw_db_error( $last_error ) {
-		if ( false !== stripos( $last_error, 'tablespace' ) || false !== stripos( $last_error, 'access denied' ) ) {
-			throw new Exception( sprintf( __( 'Database error during restore: %s', 'unboundwp' ), $last_error ) );
+		$fatal = array( 'tablespace', 'access denied', 'no space left', 'disk full', 'read-only', 'read only' );
+		foreach ( $fatal as $needle ) {
+			if ( false !== stripos( (string) $last_error, $needle ) ) {
+				throw new Exception( sprintf( __( 'Database error during restore: %s', 'unboundwp' ), $last_error ) );
+			}
 		}
 	}
 
@@ -731,7 +1153,7 @@ class UWP_Database {
 			$state['table_index'] = 0;
 		}
 		if ( ! isset( $state['offset'] ) ) {
-			$state['offset'] = 0;
+			$state['offset'] = '';
 		}
 		if ( ! isset( $state['needles'] ) || ! is_array( $state['needles'] ) ) {
 			$state['needles'] = self::needles_from_pairs( $pairs );
@@ -744,8 +1166,15 @@ class UWP_Database {
 		$table = isset( $tables[ (int) $state['table_index'] ] ) ? $tables[ (int) $state['table_index'] ] : null;
 		if ( ! is_string( $table ) || '' === $table ) {
 			$state['table_index'] = (int) $state['table_index'] + 1;
-			$state['offset']      = 0;
+			$state['offset']      = '';
 			return (int) $state['table_index'] >= UWP_Helpers::safe_count( $tables );
+		}
+		// Each table starts at "before the first key" (''): works for
+		// integer and string primary keys alike, including jobs resumed
+		// from versions that stored a numeric 0 here.
+		if ( ! isset( $state['current_table'] ) || $state['current_table'] !== $table ) {
+			$state['current_table'] = $table;
+			$state['offset']        = '';
 		}
 
 		// Shrink batches when memory runs hot: a few small rows beat one
@@ -755,11 +1184,18 @@ class UWP_Database {
 		}
 
 		// Primary key for stable paging (fall back to OFFSET when none).
+		// Keyset paging is type-aware: a table whose single-column primary
+		// key is a string (slug, code, UUID…) must be compared as a string,
+		// otherwise `pk > 0` silently matches nothing and its rows would
+		// never have URLs replaced. Empty offset = "start of table" and
+		// works for both types (`pk > ''`).
 		$pk = self::primary_key( $table );
 
 		if ( $pk ) {
+			$last = $state['offset'];
+			$ph   = ( is_int( $last ) || ( is_string( $last ) && ctype_digit( $last ) ) ) ? '%d' : '%s';
 			// phpcs:ignore -- internal identifiers.
-			$rows = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM `{$table}` WHERE `{$pk}` > %d ORDER BY `{$pk}` ASC LIMIT %d", (int) $state['offset'], $rows_per_tick ), ARRAY_A );
+			$rows = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM `{$table}` WHERE `{$pk}` > {$ph} ORDER BY `{$pk}` ASC LIMIT %d", $last, $rows_per_tick ), ARRAY_A );
 		} else {
 			// phpcs:ignore -- internal identifiers.
 			$rows = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM `{$table}` LIMIT %d OFFSET %d", $rows_per_tick, (int) $state['offset'] ), ARRAY_A );
@@ -767,11 +1203,12 @@ class UWP_Database {
 
 		if ( empty( $rows ) || ! is_array( $rows ) ) {
 			$state['table_index'] = (int) $state['table_index'] + 1;
-			$state['offset'] = 0;
+			$state['offset'] = '';
 			return (int) $state['table_index'] >= UWP_Helpers::safe_count( $tables );
 		}
 
 		$n = 0;
+		$last_pk = null;
 		$needles = is_array( $state['needles'] ) ? $state['needles'] : array();
 		foreach ( $rows as $row ) {
 			if ( ! is_array( $row ) ) {
@@ -809,7 +1246,7 @@ class UWP_Database {
 			}
 
 			if ( null !== $pkval ) {
-				$state['offset'] = max( (int) $state['offset'], (int) $pkval );
+				$last_pk = $pkval;
 			}
 
 			// Release cycles as we go so giant rows can't pile up.
@@ -825,8 +1262,12 @@ class UWP_Database {
 		$row_count = UWP_Helpers::safe_count( $rows );
 		unset( $rows );
 
-		if ( ! $pk ) {
-			$state['offset'] += $row_count;
+		if ( $pk ) {
+			if ( null !== $last_pk ) {
+				$state['offset'] = $last_pk; // keeps string keys as strings.
+			}
+		} else {
+			$state['offset'] = (int) $state['offset'] + $row_count;
 		}
 		return false;
 	}
@@ -1016,7 +1457,14 @@ class UWP_Database {
 			$pairs[ (string) $old ] = (string) $new;
 		};
 
-		// URL pairs: site, home and uploads, each with www/scheme variants.
+		// URL pairs: site, home and uploads.
+		//
+		// Every scheme (http, https, schemeless) and www/non-www variant of
+		// the OLD url maps onto the DESTINATION's canonical scheme+host with
+		// the same path. The previous positional mapping kept the source
+		// scheme, so an http -> https migration left every internal link on
+		// http://new-domain (redirect chains, mixed content). The new host is
+		// the single source of truth, which is also what Ai1WM users expect.
 		$url_sets = array(
 			array( $old_site, $new_site ),
 			array( $old_home, $new_home ),
@@ -1029,36 +1477,78 @@ class UWP_Database {
 			if ( '' === $old || '' === $new || $old === $new ) {
 				continue;
 			}
-			// Both sides must be absolute URLs with hosts; otherwise the
-			// positional variant mapping cannot align (e.g. a bare path
-			// would map onto the wrong new variant).
-			$old_host = parse_url( $old, PHP_URL_HOST );
-			$new_host = parse_url( $new, PHP_URL_HOST );
-			if ( empty( $old_host ) || empty( $new_host ) ) {
+			// Both sides must be absolute URLs with hosts; otherwise there is
+			// no meaningful scheme/host to canonicalize.
+			$old_parts = parse_url( $old );
+			$new_parts = parse_url( $new );
+			if ( ! is_array( $old_parts ) || ! is_array( $new_parts )
+				|| empty( $old_parts['host'] ) || empty( $new_parts['host'] ) ) {
 				continue;
 			}
-			$old_variants = self::url_variants( $old );
-			$new_variants = self::url_variants( $new );
-			// Positional mapping: plain→plain, http→http, … (same count by
-			// construction when both parse as absolute URLs).
-			$count = min( UWP_Helpers::safe_count( $old_variants ), UWP_Helpers::safe_count( $new_variants ) );
-			for ( $i = 0; $i < $count; $i++ ) {
-				$ov = $old_variants[ $i ];
-				$nv = $new_variants[ $i ];
-				$add( $ov, $nv );
-				$add( urlencode( $ov ), urlencode( $nv ) );
-				$add( rawurlencode( $ov ), rawurlencode( $nv ) );
-				$add( addcslashes( $ov, '/' ), addcslashes( $nv, '/' ) );
+			$old_rest = '';
+			if ( isset( $old_parts['path'] ) ) {
+				$old_rest .= $old_parts['path'];
 			}
+			if ( isset( $old_parts['query'] ) ) {
+				$old_rest .= '?' . $old_parts['query'];
+			}
+			$old_rest = rtrim( $old_rest, '/' );
+
+			$new_rest = '';
+			if ( isset( $new_parts['path'] ) ) {
+				$new_rest .= $new_parts['path'];
+			}
+			if ( isset( $new_parts['query'] ) ) {
+				$new_rest .= '?' . $new_parts['query'];
+			}
+			$new_rest = rtrim( $new_rest, '/' );
+
+			$new_scheme = isset( $new_parts['scheme'] ) ? strtolower( (string) $new_parts['scheme'] ) : 'https';
+			if ( ! in_array( $new_scheme, array( 'http', 'https' ), true ) ) {
+				$new_scheme = 'https';
+			}
+			$new_host = $new_parts['host'];
+			$new_hosts = self::host_variants( $new_host );
+			$old_hosts = self::host_variants( $old_parts['host'] );
+
+			// Every old variant -> canonical destination URL.
+			$canonical = $new_scheme . '://' . $new_host . $new_rest;
+			foreach ( $old_hosts as $oh ) {
+				foreach ( array( 'http', 'https', '' ) as $scheme ) {
+					if ( '' === $scheme ) {
+						$ov = '//' . $oh . $old_rest;
+						$nv = '//' . $new_host . $new_rest; // schemeless stays schemeless.
+					} else {
+						$ov = $scheme . '://' . $oh . $old_rest;
+						$nv = $canonical; // both schemes normalize to the destination.
+					}
+					$add( $ov, $nv );
+					$add( urlencode( $ov ), urlencode( $nv ) );
+					$add( rawurlencode( $ov ), rawurlencode( $nv ) );
+					$add( addcslashes( $ov, '/' ), addcslashes( $nv, '/' ) );
+				}
+			}
+			// Values that already name the destination host but use another
+			// scheme (or www form) are normalized to the canonical URL too.
+			foreach ( $new_hosts as $nh ) {
+				foreach ( array( 'http', 'https' ) as $scheme ) {
+					$ov = $scheme . '://' . $nh . $new_rest;
+					if ( $ov !== $canonical ) {
+						$add( $ov, $canonical );
+					}
+				}
+				$add( '//' . $nh . $new_rest, '//' . $new_host . $new_rest );
+			}
+
 			// Quoted bare hosts (JSON attributes etc.), never bare hosts
 			// (a bare replace would corrupt e.g. myold.com).
-			$old_host = strtolower( (string) parse_url( $old, PHP_URL_HOST ) );
-			$new_host = strtolower( (string) parse_url( $new, PHP_URL_HOST ) );
-			if ( '' !== $old_host && '' !== $new_host && $old_host !== $new_host ) {
+			$old_host_lc = strtolower( (string) $old_parts['host'] );
+			$new_host_lc = strtolower( $new_host );
+			if ( '' !== $old_host_lc && '' !== $new_host_lc && $old_host_lc !== $new_host_lc ) {
 				foreach ( array( '="', "='", '://' ) as $prefix ) {
-					$add( $prefix . $old_host, $prefix . $new_host );
+					$add( $prefix . $old_host_lc, $prefix . $new_host_lc );
 				}
-				$add( '@' . $old_host, '@' . $new_host ); // emails.
+				$add( '@' . $old_host_lc, '@' . $new_host_lc ); // emails.
 			}
 		}
 
@@ -1093,42 +1583,19 @@ class UWP_Database {
 	}
 
 	/**
-	 * Scheme × www variants of one absolute URL, in fixed canonical order.
+	 * The www / non-www forms of one host, original first.
 	 *
-	 * The order must NEVER depend on the input (no scheme-first): old and
-	 * new URLs usually have different schemes, and positional mapping only
-	 * works when variant[i] means the same thing for both sides.
-	 *
-	 * @param string $url Absolute URL.
-	 * @return array Variant strings (identical positions for any input).
+	 * @param string $host Host name.
+	 * @return array Unique host strings.
 	 */
-	protected static function url_variants( $url ) {
-		$url   = rtrim( trim( (string) $url ), '/' );
-		$parts = parse_url( $url );
-		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
-			return array( $url );
+	protected static function host_variants( $host ) {
+		$host = (string) $host;
+		if ( '' === $host ) {
+			return array();
 		}
-		$host = $parts['host'];
-		$rest = '';
-		if ( isset( $parts['path'] ) ) {
-			$rest .= $parts['path'];
-		}
-		if ( isset( $parts['query'] ) ) {
-			$rest .= '?' . $parts['query'];
-		}
-		$rest = rtrim( $rest, '/' );
-		$www  = 'www.' . preg_replace( '/^www\./i', '', $host );
 		$bare = preg_replace( '/^www\./i', '', $host );
-
-		$hosts = array_unique( array( $host, $www, $bare ) );
-		$out   = array();
-		foreach ( array( 'http', 'https', '' ) as $s ) {
-			$prefix = '' === $s ? '//' : $s . '://';
-			foreach ( $hosts as $h ) {
-				$out[] = $prefix . $h . $rest;
-			}
-		}
-		return array_values( array_unique( $out ) );
+		$www  = 'www.' . $bare;
+		return array_values( array_unique( array( $host, $www, $bare ) ) );
 	}
 
 	/**

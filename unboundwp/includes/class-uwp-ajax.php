@@ -37,6 +37,7 @@ class UWP_Ajax {
 			'uwp_export_tick',
 			'uwp_export_cancel',
 			'uwp_upload_chunk',
+			'uwp_upload_status',
 			'uwp_import_start',
 			'uwp_import_tick',
 			'uwp_import_cancel',
@@ -109,6 +110,29 @@ class UWP_Ajax {
 
 				case 'uwp_upload_chunk':
 					self::upload_chunk();
+					break;
+
+				case 'uwp_upload_status':
+					// How many bytes of this upload does the server already
+					// have? Lets a reloaded page (or a retry after a PHP
+					// worker recycle / 502) resume instead of restarting a
+					// multi-hundred-MB upload from zero.
+					UWP_Helpers::check_request();
+					$name = isset( $_POST['file_name'] ) ? sanitize_file_name( wp_unslash( $_POST['file_name'] ) ) : ''; // phpcs:ignore
+					if ( '' === $name || ! UWP_Helpers::is_supported_archive( $name ) ) {
+						wp_send_json_error( array( 'message' => __( 'Only .uwp and .wpress files can be uploaded.', 'unboundwp' ) ) );
+					}
+					$path     = trailingslashit( uwp_temp_dir() ) . 'uploads/' . $name;
+					$received = is_file( $path ) ? (int) filesize( $path ) : 0;
+					$archive_ok = $received >= UWP_Archive::HEADER_SIZE && self::looks_like_archive( $path );
+					wp_send_json_success(
+						array(
+							'file'       => $name,
+							'received'   => $received,
+							'archive_ok' => (bool) $archive_ok,
+							'message'    => $received > 0 ? __( 'Resuming upload…', 'unboundwp' ) : __( 'Uploading…', 'unboundwp' ),
+						)
+					);
 					break;
 
 				case 'uwp_import_start':
@@ -220,10 +244,22 @@ class UWP_Ajax {
 
 					$secret = isset( $_REQUEST['job_secret'] ) ? (string) $_REQUEST['job_secret'] : ''; // phpcs:ignore
 					$state  = null;
-					if ( '' !== $secret ) {
-						$candidate = UWP_Helpers::job_load( $key );
-						if ( is_array( $candidate ) && isset( $candidate['secret'] ) && hash_equals( (string) $candidate['secret'], $secret ) ) {
-							$state = $candidate;
+					if ( '' !== $secret && UWP_Helpers::job_secret_matches( $key, $secret ) ) {
+						$state = UWP_Helpers::job_load( $key );
+						if ( null === $state ) {
+							// The secret is valid, so a job exists - the state
+							// JSON is just being atomically replaced right
+							// now. Report "working" instead of an auth-style
+							// error the UI would misread as a dead session.
+							wp_send_json_success(
+								array(
+									'active'  => true,
+									'done'    => false,
+									'percent' => -1,
+									'message' => __( 'Working…', 'unboundwp' ),
+									'nonce'   => wp_create_nonce( 'uwp_nonce' ),
+								)
+							);
 						}
 					}
 					if ( null === $state ) {
@@ -248,7 +284,7 @@ class UWP_Ajax {
 							'nonce'   => wp_create_nonce( 'uwp_nonce' ),
 							// Hand over the job secret so the reloaded page
 							// can tick without depending on the session.
-							'secret'  => isset( $state['secret'] ) ? $state['secret'] : '',
+							'secret'  => UWP_Helpers::job_get_secret( $key ),
 						)
 					);
 					break;
@@ -325,9 +361,9 @@ class UWP_Ajax {
 	 *   - partial write → only the missing tail is appended;
 	 *   - temp wiped mid-upload → browser restarts cleanly from zero.
 	 *
-	 * Because slices are small (2 MB, shrinking on strict hosts),
+	 * Because slices are small (8 MB by default, halving automatically on strict hosts),
 	 * PHP's upload_max_filesize / post_max_size never matter - a 20 GB
-	 * backup uploads just as well as a 2 MB one.
+	 * backup uploads just as well as a tiny one.
 	 */
 	protected static function upload_chunk() {
 		UWP_Helpers::check_request();
@@ -341,6 +377,23 @@ class UWP_Ajax {
 		}
 		if ( $total_size <= 0 ) {
 			wp_send_json_error( array( 'message' => __( 'Empty file. Please choose a real backup.', 'unboundwp' ) ) );
+		}
+		// First slice: refuse an upload that provably cannot fit instead of
+		// failing at 99% with a vague "cannot write" error.
+		if ( 0 === $offset ) {
+			$free = UWP_Helpers::disk_free_bytes( uwp_temp_dir() );
+			if ( false !== $free && $total_size > $free ) {
+				wp_send_json_error(
+					array(
+						'message' => sprintf(
+							/* translators: 1: file size, 2: free space */
+							__( 'Not enough free disk space: this backup is %1$s but only %2$s is available. Free some space and try again.', 'unboundwp' ),
+							size_format( $total_size ),
+							size_format( $free )
+						),
+					)
+				);
+			}
 		}
 		if ( empty( $_FILES['slice'] ) || ! isset( $_FILES['slice']['error'] ) ) { // phpcs:ignore
 			wp_send_json_error(

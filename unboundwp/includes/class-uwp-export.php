@@ -35,6 +35,8 @@ class UWP_Export {
 		if ( function_exists( 'uwp_ensure_directories' ) ) {
 			uwp_ensure_directories();
 		}
+		// A new job is the natural moment to clear abandoned work.
+		UWP_Helpers::prune_temp_orphans();
 
 		$job_id   = 'export-' . gmdate( 'Ymd-His' ) . '-' . substr( wp_generate_password( 8, false, false ), 0, 6 );
 		$work_dir = trailingslashit( uwp_temp_dir() ) . $job_id . '/';
@@ -91,7 +93,15 @@ class UWP_Export {
 			}
 		}
 
+		// The bearer secret is stored in its own guarded file and NEVER in
+		// the state JSON: on nginx (which ignores .htaccess) a guessable
+		// state-*.json would expose the token. It is returned to the caller
+		// once, for the browser, and read back from the file afterwards.
+		$secret = $state['secret'];
+		unset( $state['secret'] );
 		self::save( $state );
+		UWP_Helpers::job_write_secret( self::STATE_OPTION, $secret );
+		$state['secret'] = $secret; // return value only - not persisted.
 		UWP_Helpers::job_clear_done( self::STATE_OPTION ); // no stale completion.
 		if ( class_exists( 'UWP_Logger' ) ) {
 			UWP_Logger::prune();
@@ -105,7 +115,7 @@ class UWP_Export {
 		if ( false !== $free && $free < 104857600 ) {
 			throw new Exception( sprintf( __( 'Not enough disk space for a backup: %s free. Free space and try again.', 'unboundwp' ), size_format( $free ) ) );
 		}
-		UWP_Helpers::debug_log( sprintf( 'export started: job %s', $job_id ) );
+		UWP_Helpers::debug_log( sprintf( 'export %s: started', $job_id ) );
 		return $state;
 	}
 
@@ -304,9 +314,7 @@ class UWP_Export {
 		}
 
 		if ( empty( $result['done'] ) ) {
-			$state            = self::load();
-			$secret           = ( is_array( $state ) && isset( $state['secret'] ) ) ? (string) $state['secret'] : '';
-			$result['chained'] = UWP_Helpers::chain_self( 'uwp_export_tick', $secret );
+			$result['chained'] = UWP_Helpers::chain_self( 'uwp_export_tick', UWP_Helpers::job_get_secret( self::STATE_OPTION ) );
 		}
 		return $result;
 	}
@@ -342,7 +350,7 @@ class UWP_Export {
 		if ( null === $state ) {
 			throw new Exception( __( 'No export in progress. Please start a new export.', 'unboundwp' ) );
 		}
-		$pinned = UWP_Helpers::job_take_fatal( self::STATE_OPTION );
+		$pinned = UWP_Helpers::job_take_fatal( self::STATE_OPTION, isset( $state['created'] ) ? (int) $state['created'] : 0 );
 		if ( null !== $pinned ) {
 			// Self-healing for poison batches: if the previous tick died
 			// twice in a row at the exact same database cursor, skip one
@@ -386,7 +394,7 @@ class UWP_Export {
 				throw new Exception( __( 'Cannot write database dump.', 'unboundwp' ) );
 			}
 			while ( ! UWP_Helpers::out_of_time( $started ) && ! UWP_Helpers::memory_hot() ) {
-				$finished = UWP_Database::dump_tick( $out, $state['db_state'], 250, $started + UWP_AJAX_TIME_BUDGET );
+				$finished = UWP_Database::dump_tick( $out, $state['db_state'], 250, $started + UWP_Helpers::time_budget() );
 				if ( $finished ) {
 					break;
 				}
@@ -412,6 +420,21 @@ class UWP_Export {
 
 		// Step 3: stream everything into the archive.
 		if ( 'archive' === $state['step'] ) {
+			// A previous write error that could not be rolled back makes
+			// the current archive untrustworthy. Rebuild it from scratch
+			// (the database dump and file list are unaffected) instead of
+			// appending after broken bytes.
+			if ( ! empty( $state['archive_corrupt'] ) ) {
+				UWP_Helpers::debug_log( sprintf( 'export %s: rebuilding archive after an unrecoverable write error', $state['job_id'] ) );
+				@file_put_contents( $state['archive_tmp'], '' ); // phpcs:ignore
+				$state['archive_corrupt'] = false;
+				$state['pkg_written']     = false;
+				$state['db_archived']     = false;
+				$state['file_index']      = 0;
+				$state['list_offset']     = 0;
+				$state['root_emitted']    = array();
+				self::save( $state );
+			}
 			$archive = UWP_Archive::open_for_append( $state['archive_tmp'] );
 
 			// 3a) package.json first (so imports can read metadata fast).
@@ -515,6 +538,16 @@ class UWP_Export {
 							$base_part = basename( $rel );
 							try {
 								UWP_Archive::append_file( $archive, $abs, '.' === $dir_part ? '.' : $dir_part, $base_part, isset( $state['password'] ) ? $state['password'] : null );
+							} catch ( UWP_Archive_Corrupt_Exception $e ) {
+								// Never append after a broken entry: mark the
+								// archive for a rebuild and surface the reason.
+								if ( is_resource( $archive ) ) {
+									fclose( $archive );
+								}
+								$archive = null;
+								$state['archive_corrupt'] = true;
+								self::save( $state );
+								throw $e;
 							} catch ( Exception $e ) {
 								// One unreadable file must never kill a whole
 								// export: count it, log it, keep going.
@@ -532,10 +565,15 @@ class UWP_Export {
 					}
 				}
 			}
-			$state['list_offset'] = ftell( $list );
+			$list_pos = ftell( $list );
+			if ( false !== $list_pos ) {
+				$state['list_offset'] = $list_pos;
+			}
 			fclose( $list );
 		}
-		fclose( $archive );
+		if ( is_resource( $archive ) ) {
+			fclose( $archive );
+		}
 		self::save( $state );
 
 		$pct = 40 + (int) ( 55 * ( $total > 0 ? $state['file_index'] / $total : 1 ) );
@@ -548,14 +586,37 @@ class UWP_Export {
 
 		// Step 4: finalize - EOF, move to backups, cleanup.
 		if ( 'finalize' === $state['step'] ) {
-			$archive = UWP_Archive::open_for_append( $state['archive_tmp'] );
-			UWP_Archive::finish( $archive ); // finish() appends EOF and closes.
+			// Never "finish" a missing or empty assembly: opening a fresh
+			// file and writing the EOF marker would produce a structurally
+			// valid but EMPTY backup that looks like a success.
+			$tmp_archive = isset( $state['archive_tmp'] ) ? (string) $state['archive_tmp'] : '';
+			if ( '' === $tmp_archive || ! is_file( $tmp_archive ) ) {
+				throw new Exception( __( 'The archive being built is missing. Please start a new export.', 'unboundwp' ) );
+			}
+			clearstatcache( true, $tmp_archive );
+			if ( (int) filesize( $tmp_archive ) <= UWP_Archive::HEADER_SIZE ) {
+				throw new Exception( __( 'The archive being built is empty. Please start a new export.', 'unboundwp' ) );
+			}
+			if ( empty( $state['db_archived'] ) ) {
+				throw new Exception( __( 'The database was not written into the archive. Please start a new export.', 'unboundwp' ) );
+			}
+			$archive = UWP_Archive::open_for_append( $tmp_archive );
+			if ( is_resource( $archive ) ) {
+				UWP_Archive::finish( $archive ); // finish() appends EOF and closes.
+			}
 
 			$dest = trailingslashit( uwp_backups_dir() ) . $state['final_name'];
 			if ( ! @rename( $state['archive_tmp'], $dest ) ) { // phpcs:ignore
 				// Cross-filesystem fallback: stream copy.
-				self::copy_big( $state['archive_tmp'], $dest );
+				if ( ! UWP_Helpers::stream_copy( $state['archive_tmp'], $dest ) ) {
+					throw new Exception( __( 'Cannot move the finished backup into the backups directory. Check permissions and disk space, then Resume.', 'unboundwp' ) );
+				}
 				@unlink( $state['archive_tmp'] ); // phpcs:ignore
+			}
+			clearstatcache( true, $dest );
+			$final_size = is_file( $dest ) ? (int) filesize( $dest ) : 0;
+			if ( $final_size <= 0 ) {
+				throw new Exception( __( 'The finished backup is missing or empty. Check disk space, then Resume.', 'unboundwp' ) );
 			}
 
 			UWP_Helpers::trash_dir( $state['work_dir'] );
@@ -594,7 +655,7 @@ class UWP_Export {
 					'message' => $done_message,
 					'job_id'  => $state['job_id'],
 					'file'    => $file_name,
-					'size'    => filesize( $dest ),
+					'size'    => $final_size,
 				)
 			);
 
@@ -604,7 +665,7 @@ class UWP_Export {
 				'percent' => 100,
 				'message' => $done_message,
 				'file'    => $file_name,
-				'size'    => filesize( $dest ),
+				'size'    => $final_size,
 				'nonce'   => wp_create_nonce( 'uwp_nonce' ),
 				// Direct download link, like the original plugin shows after export.
 				'download_url' => admin_url(
@@ -644,25 +705,17 @@ class UWP_Export {
 			self::save( $state );
 		}
 		$buf = array();
-		$skip = array(
-			// Never archive our own temp work or finished backups inside uploads.
-			'unboundwp-temp',
-			'unboundwp-backups',
-			'ai1wm-backups',
-			// Cache / backup noise that bloats archives and breaks restores.
-			'cache',
-			'wflogs',
-		);
 
 		while ( ! empty( $state['dirs'] ) && ! UWP_Helpers::out_of_time( $started ) ) {
-			$dir = array_pop( $state['dirs'] );
-			if ( ! is_dir( $dir ) || ! is_readable( $dir ) ) {
+			$dir    = array_pop( $state['dirs'] );
+			$dir_io = UWP_Helpers::win_path( $dir );
+			if ( ! is_dir( $dir_io ) || ! is_readable( $dir_io ) ) {
 				continue;
 			}
 			// Stream entries one by one (opendir/readdir), NEVER scandir():
 			// a single cache/session dir with hundreds of thousands of
 			// files would otherwise blow PHP memory in one call.
-			$handle = @opendir( $dir ); // phpcs:ignore
+			$handle = @opendir( $dir_io ); // phpcs:ignore
 			if ( false === $handle ) {
 				continue;
 			}
@@ -671,24 +724,18 @@ class UWP_Export {
 				if ( '.' === $entry || '..' === $entry ) {
 					continue;
 				}
-				$full = $dir . DIRECTORY_SEPARATOR . $entry;
+				$full    = $dir . DIRECTORY_SEPARATOR . $entry;
+				$full_io = UWP_Helpers::win_path( $full );
 				// Skip symlinks that escape the scanned roots (safety).
-				if ( is_link( $full ) ) {
+				if ( is_link( $full_io ) ) {
 					continue;
 				}
-				if ( is_dir( $full ) ) {
-					$base = basename( $full );
-					if ( in_array( strtolower( $base ), $skip, true ) ) {
-						// Still allow the top-level uploads dir itself, just skip
-						// known-noisy subfolders by name match at any depth except
-						// exact backup/temp dirs handled above. Keep it simple:
-						// skip directories literally named as below.
-						if ( in_array( $base, array( 'unboundwp-temp', 'unboundwp-backups', 'ai1wm-backups' ), true ) ) {
-							continue;
-						}
+				if ( is_dir( $full_io ) ) {
+					if ( self::skip_directory( $full ) ) {
+						continue;
 					}
 					$state['dirs'][] = $full;
-				} elseif ( UWP_Helpers::is_regular_file( $full ) ) {
+				} elseif ( UWP_Helpers::is_regular_file( $full_io ) ) {
 					// Dedupe against recently appended paths: a re-queued
 					// directory replays its head next tick. The window covers
 					// typical replays; anything beyond it may archive twice
@@ -733,6 +780,46 @@ class UWP_Export {
 		if ( empty( $state['dirs'] ) ) {
 			$state['scan_done'] = true;
 		}
+	}
+
+	/**
+	 * Should this directory be left OUT of the archive?
+	 *
+	 * Kept deliberately narrow and explicit. The previous name-match list
+	 * never actually skipped anything: it lowercased for the lookup but
+	 * compared the untouched basename in the inner check, so every cache
+	 * dir was silently archived anyway.
+	 *
+	 * Excluded:
+	 * - our own work/backup dirs and Ai1WM's backup dir (never recurse
+	 *   into backups),
+	 * - version-control metadata (never needed on a restored site),
+	 * - regenerable caches/upgrades at the wp-content ROOT only (a plugin
+	 *   may legitimately ship its own "cache" folder inside itself).
+	 *
+	 * @param string $dir Absolute directory path.
+	 * @return bool True when the directory must be skipped.
+	 */
+	public static function skip_directory( $dir ) {
+		$path = str_replace( '\\', '/', (string) $dir );
+		$base = strtolower( basename( $path ) );
+		if ( '' === $base || '.' === $base || '..' === $base ) {
+			return false;
+		}
+		$always = array( 'unboundwp-temp', 'unboundwp-backups', 'ai1wm-backups', 'ai1wm-storage', '.git', '.svn', '.hg' );
+		$skip   = in_array( $base, $always, true );
+		if ( ! $skip && defined( 'WP_CONTENT_DIR' ) ) {
+			$content = rtrim( wp_normalize_path( WP_CONTENT_DIR ), '/' );
+			$parent  = rtrim( wp_normalize_path( dirname( $path ) ), '/' );
+			if ( $parent === $content && in_array( $base, array( 'cache', 'upgrade', 'upgrade-temp-backup', 'wflogs' ), true ) ) {
+				$skip = true;
+			}
+		}
+		// Extensibility without editing the plugin (WP context only).
+		if ( function_exists( 'apply_filters' ) ) {
+			$skip = (bool) apply_filters( 'uwp_export_skip_directory', $skip, $dir );
+		}
+		return $skip;
 	}
 
 	/**
@@ -898,6 +985,12 @@ class UWP_Export {
 				'Version' => UWP_VERSION,
 				'Format'  => 'wpress-compatible',
 			),
+			'Backup'         => array(
+				'Tool'     => 'UnboundWP',
+				'Version'  => UWP_VERSION,
+				'Created'  => gmdate( 'c' ),
+				'Encrypted' => '' !== $password,
+			),
 			'SiteURL'        => get_option( 'siteurl' ),
 			'HomeURL'        => get_option( 'home' ),
 			'UploadsURL'     => isset( $uploads['baseurl'] ) ? $uploads['baseurl'] : '',
@@ -981,38 +1074,11 @@ class UWP_Export {
 			'step'    => $state['step'],
 			'percent' => max( 0, min( 99, (int) $percent ) ),
 			'message' => $message,
-			'files'   => UWP_Helpers::safe_count( isset( $state['files'] ) ? $state['files'] : array() ),
+			// Real archived count (state['files'] is only a legacy bridge).
+			'files'   => isset( $state['file_index'] ) ? (int) $state['file_index'] : UWP_Helpers::safe_count( isset( $state['files'] ) ? $state['files'] : array() ),
 			// Fresh nonce every tick: long exports can outlive the nonce
 			// that was printed when the admin page loaded.
 			'nonce'   => wp_create_nonce( 'uwp_nonce' ),
 		);
-	}
-
-	/**
-	 * Stream-copy a big file (rename fallback across filesystems).
-	 *
-	 * @param string $from Source.
-	 * @param string $to Destination.
-	 * @throws Exception On failure.
-	 */
-	protected static function copy_big( $from, $to ) {
-		$in = @fopen( $from, 'rb' ); // phpcs:ignore
-		if ( false === $in ) {
-			throw new Exception( __( 'Cannot finalize backup.', 'unboundwp' ) );
-		}
-		$out = @fopen( $to, 'wb' ); // phpcs:ignore
-		if ( false === $out ) {
-			fclose( $in );
-			throw new Exception( __( 'Cannot write to backups directory.', 'unboundwp' ) );
-		}
-		while ( ! feof( $in ) ) {
-			$data = fread( $in, UWP_CHUNK_BYTES ); // phpcs:ignore
-			if ( false === $data || '' === $data ) {
-				break;
-			}
-			fwrite( $out, $data ); // phpcs:ignore
-		}
-		fclose( $in );
-		fclose( $out );
 	}
 }

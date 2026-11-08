@@ -73,9 +73,8 @@ class UWP_Helpers {
 	public static function check_job_request( $state_key ) {
 		$secret = isset( $_REQUEST['job_secret'] ) ? (string) $_REQUEST['job_secret'] : ''; // phpcs:ignore
 		if ( '' !== $secret ) {
-			$state = self::job_load( $state_key );
-			if ( is_array( $state ) && isset( $state['secret'] ) && is_string( $state['secret'] ) && hash_equals( $state['secret'], $secret ) ) {
-				return $state;
+			if ( self::job_secret_matches( $state_key, $secret ) ) {
+				return self::job_load( $state_key );
 			}
 			wp_send_json_error(
 				array( 'message' => __( 'Invalid job token. Reload the page and resume with your login.', 'unboundwp' ) ),
@@ -103,11 +102,8 @@ class UWP_Helpers {
 	 */
 	public static function check_job_or_admin( $state_key ) {
 		$secret = isset( $_REQUEST['job_secret'] ) ? (string) $_REQUEST['job_secret'] : ''; // phpcs:ignore
-		if ( '' !== $secret ) {
-			$state = self::job_load( $state_key );
-			if ( is_array( $state ) && isset( $state['secret'] ) && is_string( $state['secret'] ) && hash_equals( $state['secret'], $secret ) ) {
-				return $state;
-			}
+		if ( '' !== $secret && self::job_secret_matches( $state_key, $secret ) ) {
+			return self::job_load( $state_key );
 		}
 		self::check_request();
 		return self::job_load( $state_key );
@@ -158,6 +154,103 @@ class UWP_Helpers {
 	}
 	public static function new_job_secret() {
 		return bin2hex( random_bytes( 24 ) );
+	}
+
+	/**
+	 * Absolute path of a job's bearer-secret file.
+	 *
+	 * A .php file on purpose: on hosts where .htaccess is ignored (nginx),
+	 * a guessable state-*.json would be publicly readable and leak the
+	 * bearer token. Requesting this file executes it and exits silently.
+	 *
+	 * @param string $key Job key.
+	 * @return string
+	 */
+	public static function job_secret_file( $key ) {
+		$key = preg_replace( '/[^a-z0-9_-]/i', '', (string) $key );
+		return trailingslashit( uwp_temp_dir() ) . 'secret-' . $key . '.php';
+	}
+
+	/**
+	 * Prefix that makes a secret file inert when requested directly.
+	 *
+	 * @return string
+	 */
+	protected static function job_secret_guard() {
+		return "<?php // UnboundWP job secret. Direct access is a no-op.\nexit;\n?>\n";
+	}
+
+	/**
+	 * Persist a job's bearer secret (written once, never rotated).
+	 *
+	 * @param string $key Job key.
+	 * @param string $secret Secret.
+	 */
+	public static function job_write_secret( $key, $secret ) {
+		if ( ! is_string( $secret ) || '' === $secret ) {
+			return;
+		}
+		$dir = uwp_temp_dir();
+		if ( ! file_exists( $dir ) ) {
+			wp_mkdir_p( $dir );
+		}
+		@file_put_contents( self::job_secret_file( $key ), self::job_secret_guard() . $secret, LOCK_EX ); // phpcs:ignore
+	}
+
+	/**
+	 * Remove a job's bearer secret (cancel / completion).
+	 *
+	 * @param string $key Job key.
+	 */
+	public static function job_clear_secret( $key ) {
+		@unlink( self::job_secret_file( $key ) ); // phpcs:ignore
+	}
+
+	/**
+	 * Read a job's stored bearer secret.
+	 *
+	 * @param string $key Job key.
+	 * @return string Secret or '' when none.
+	 */
+	public static function job_get_secret( $key ) {
+		$file = self::job_secret_file( $key );
+		if ( ! is_file( $file ) ) {
+			$state = self::job_load( $key );
+			return ( is_array( $state ) && isset( $state['secret'] ) && is_string( $state['secret'] ) ) ? $state['secret'] : '';
+		}
+		$raw = @file_get_contents( $file ); // phpcs:ignore
+		if ( ! is_string( $raw ) || '' === $raw ) {
+			return '';
+		}
+		$pos = strpos( $raw, "?>\n" );
+		if ( false === $pos ) {
+			$pos = strpos( $raw, '?>' );
+			$raw = ( false === $pos ) ? $raw : substr( $raw, $pos + 2 );
+		} else {
+			$raw = substr( $raw, $pos + 3 );
+		}
+		return trim( $raw );
+	}
+
+	/**
+	 * Constant-time check of a request's job secret.
+	 *
+	 * Prefers the small secret file; falls back to the state array so jobs
+	 * started by older versions keep working.
+	 *
+	 * @param string $key Job key.
+	 * @param string $secret Secret from the request.
+	 * @return bool
+	 */
+	public static function job_secret_matches( $key, $secret ) {
+		if ( ! is_string( $secret ) || '' === $secret ) {
+			return false;
+		}
+		$stored = self::job_get_secret( $key );
+		if ( '' === $stored ) {
+			return false;
+		}
+		return hash_equals( $stored, $secret );
 	}
 
 	/**
@@ -255,6 +348,11 @@ class UWP_Helpers {
 		if ( ! function_exists( 'wp_remote_post' ) || '' === $secret ) {
 			return false;
 		}
+		// Under WP-CLI the loop below is already driving the job; a chain
+		// would spawn a competing worker that only holds the lock.
+		if ( defined( 'WP_CLI' ) && WP_CLI ) {
+			return false;
+		}
 		$url = admin_url( 'admin-ajax.php' );
 		// Low connect timeout so blocked loopbacks fail fast instead of
 		// stalling the worker that fired them.
@@ -331,13 +429,64 @@ class UWP_Helpers {
 	}
 
 	/**
+	 * Seconds of work one tick may do on THIS server.
+	 *
+	 * A fixed 8s budget is fine on a 30s+ host and a fatal timeout on a
+	 * 10s one (max_execution_time also counts bootstrap time, which we
+	 * cannot see). Scale down on strict hosts instead of dying halfway
+	 * through a batch. Computed once per request.
+	 *
+	 * @return int Seconds (never below 3).
+	 */
+	public static function time_budget() {
+		static $budget = null;
+		if ( null !== $budget ) {
+			return $budget;
+		}
+		$base = (int) UWP_AJAX_TIME_BUDGET;
+		$max  = (int) ini_get( 'max_execution_time' );
+		if ( $max > 0 && $max < 30 ) {
+			// Leave headroom for WP bootstrap + shutdown; never go below 3s.
+			$base = min( $base, max( 3, (int) floor( $max * 0.5 ) ) );
+		}
+		$budget = max( 3, $base );
+		return $budget;
+	}
+
+	/**
 	 * Current time budget helper: have we spent too long on this tick?
 	 *
 	 * @param float $started Microtime when the tick started.
 	 * @return bool True when we should stop and let the browser call us again.
 	 */
 	public static function out_of_time( $started ) {
-		return ( microtime( true ) - $started ) >= UWP_AJAX_TIME_BUDGET;
+		return ( microtime( true ) - $started ) >= self::time_budget();
+	}
+
+	/**
+	 * Whether this request is an admin / AJAX / CLI context where housekeeping
+	 * (trash grinding, orphan pruning) may safely spend a few seconds.
+	 *
+	 * Front-end requests must stay fast: jobs are driven from admin-ajax.
+	 *
+	 * @return bool
+	 */
+	public static function is_job_context() {
+		if ( defined( 'WP_CLI' ) && WP_CLI ) {
+			return true;
+		}
+		if ( defined( 'DOING_CRON' ) && DOING_CRON ) {
+			// Cron runs in the background: perfect place to grind leftover
+			// trash without slowing a page view.
+			return true;
+		}
+		if ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) {
+			return true;
+		}
+		if ( function_exists( 'is_admin' ) && is_admin() ) {
+			return true;
+		}
+		return false;
 	}
 
 	/**
@@ -368,7 +517,10 @@ class UWP_Helpers {
 		if ( false === $free ) {
 			return false;
 		}
-		return (int) $free;
+		// 32-bit PHP returns a FLOAT for values above PHP_INT_MAX (e.g. a
+		// 40 GB free disk). Casting that to int overflows and can make a
+		// perfectly good upload look impossible - keep the float.
+		return is_float( $free ) ? $free : (int) $free;
 	}
 
 	/**
@@ -474,6 +626,11 @@ class UWP_Helpers {
 	/**
 	 * Persist job state atomically.
 	 *
+	 * A hard death mid-write would otherwise leave a truncated JSON file
+	 * and the whole job would look "corrupt" on the next tick. Write to a
+	 * sidecar and rename (atomic on every filesystem we run on); fall back
+	 * to a direct write when rename is blocked.
+	 *
 	 * @param string $key Job key.
 	 * @param array  $state Job state.
 	 */
@@ -483,7 +640,18 @@ class UWP_Helpers {
 		if ( ! file_exists( $dir ) ) {
 			wp_mkdir_p( $dir );
 		}
-		file_put_contents( $file, wp_json_encode( $state ), LOCK_EX ); // phpcs:ignore
+		$json = wp_json_encode( $state );
+		if ( ! is_string( $json ) || '' === $json ) {
+			$json = '{}';
+		}
+		$tmp = $file . '.tmp';
+		if ( false !== @file_put_contents( $tmp, $json, LOCK_EX ) ) { // phpcs:ignore
+			if ( @rename( $tmp, $file ) ) { // phpcs:ignore
+				return;
+			}
+			@unlink( $tmp ); // phpcs:ignore - rename blocked (locked FS).
+		}
+		@file_put_contents( $file, $json, LOCK_EX ); // phpcs:ignore
 	}
 
 	/**
@@ -495,7 +663,16 @@ class UWP_Helpers {
 	public static function job_load( $key ) {
 		$file = self::job_file( $key );
 		if ( ! is_file( $file ) ) {
-			return null;
+			// Windows rename-over-existing briefly removes the destination.
+			// If a fresh sidecar is present, wait one page-fault and retry
+			// instead of reporting "no job" in that microscopic window.
+			if ( is_file( $file . '.tmp' ) ) {
+				usleep( 30000 );
+				clearstatcache( true, $file );
+			}
+			if ( ! is_file( $file ) ) {
+				return null;
+			}
 		}
 		$raw  = file_get_contents( $file ); // phpcs:ignore
 		$data = $raw ? json_decode( $raw, true ) : null;
@@ -509,6 +686,8 @@ class UWP_Helpers {
 	 */
 	public static function job_clear( $key ) {
 		@unlink( self::job_file( $key ) ); // phpcs:ignore
+		// No state means no live job: the bearer secret must die with it.
+		self::job_clear_secret( $key );
 	}
 
 	/**
@@ -538,8 +717,11 @@ class UWP_Helpers {
 		$line = gmdate( 'Y-m-d H:i:s' ) . ' ' . $message . "\n";
 		@file_put_contents( $file, $line, FILE_APPEND ); // phpcs:ignore
 		// Mirror to the job's own log when the line carries a job id.
+		// Job ids all look like "<kind>-YYYYmmdd-His-xxxxxx"; requiring that
+		// shape keeps phrases like "export started: ..." from being filed
+		// under a job called "started".
 		if ( class_exists( 'UWP_Logger' )
-			&& preg_match( '/^(import|export|verify)\s+([A-Za-z0-9_-]{4,80}):/', $message, $m ) ) {
+			&& preg_match( '/^(import|export|verify)\s+([a-z]+-\d{8}-\d{6}-[A-Za-z0-9]{4,12}):/i', $message, $m ) ) {
 			UWP_Logger::append( $m[2], $line );
 		}
 	}
@@ -633,17 +815,36 @@ class UWP_Helpers {
 	/**
 	 * Take (read + delete) a pinned fatal, if present.
 	 *
+	 * A pin written BEFORE the current job started cannot describe this
+	 * job: it is left over from an unrelated request (typically a site
+	 * that was already broken before the restore began). Such a stale
+	 * pin used to abort the first tick of a brand-new restore with an
+	 * error nobody could act on, so it is discarded instead.
+	 *
 	 * @param string $key Job key.
+	 * @param int    $since Unix time the current job started (0 = accept any).
 	 * @return string|null
 	 */
-	public static function job_take_fatal( $key ) {
+	public static function job_take_fatal( $key, $since = 0 ) {
 		$path = self::job_fatal_path( $key );
 		if ( ! is_file( $path ) ) {
 			return null;
 		}
-		$raw = file_get_contents( $path ); // phpcs:ignore
+		$mtime = (int) @filemtime( $path ); // phpcs:ignore
+		$raw   = file_get_contents( $path ); // phpcs:ignore
 		@unlink( $path ); // phpcs:ignore
 		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return null;
+		}
+		if ( $since > 0 && $mtime > 0 && $mtime < $since ) {
+			self::debug_log(
+				sprintf(
+					'ignored stale crash pin (written %s, job started %s): %s',
+					gmdate( 'Y-m-d H:i:s', $mtime ),
+					gmdate( 'Y-m-d H:i:s', $since ),
+					substr( trim( $raw ), 0, 300 )
+				)
+			);
 			return null;
 		}
 		return trim( $raw );
@@ -700,6 +901,75 @@ class UWP_Helpers {
 	}
 
 	/**
+	 * Whether this OS is Windows (path rules differ).
+	 *
+	 * @return bool
+	 */
+	public static function is_windows() {
+		return '\\' === DIRECTORY_SEPARATOR;
+	}
+
+	/**
+	 * Path hook for Windows file I/O.
+	 *
+	 * Modern PHP Windows builds are long-path aware (longPathAware
+	 * manifest since PHP 7.1), so ordinary absolute paths beyond
+	 * MAX_PATH work: verified on Windows 11 / PHP 8.1 with a 378-char
+	 * path. Adding the "\\?\" prefix here actively BREAKS such paths,
+	 * because PHP does not normalize prefixed strings (no forward
+	 * slashes allowed, no length handling). The correct action is to
+	 * leave the path alone; the method stays as the single, documented
+	 * seam for any future path handling.
+	 *
+	 * @param string $path Absolute path.
+	 * @return string Path to pass to PHP file functions.
+	 */
+	public static function win_path( $path ) {
+		return $path;
+	}
+
+	/**
+	 * Paths Windows refuses to create, even before MAX_PATH.
+	 *
+	 * Backup sources on Linux can legitimately contain them (field case:
+	 * a stray ".../Interface." file next to ".../Interface.php");
+	 * extraction must skip those instead of failing the whole restore.
+	 * Every path SEGMENT is checked, so an invalid directory name is
+	 * caught as well.
+	 *
+	 * @param string $relative_path Archive-relative path ("/" separators).
+	 * @return bool True when Windows cannot store this path.
+	 */
+	public static function is_invalid_windows_path( $relative_path ) {
+		if ( ! self::is_windows() ) {
+			return false;
+		}
+		$reserved = array( 'CON', 'PRN', 'AUX', 'NUL' );
+		for ( $i = 1; $i <= 9; $i++ ) {
+			$reserved[] = 'COM' . $i;
+			$reserved[] = 'LPT' . $i;
+		}
+		$path = str_replace( '\\', '/', (string) $relative_path );
+		foreach ( explode( '/', $path ) as $segment ) {
+			if ( '' === $segment || '.' === $segment ) {
+				continue;
+			}
+			// Trailing dot/space is silently stripped by Win32 - fopen fails.
+			if ( '.' === substr( $segment, -1 ) || ' ' === substr( $segment, -1 ) ) {
+				return true;
+			}
+			if ( preg_match( '/[<>:"|?*\x00-\x1F]/', $segment ) ) {
+				return true;
+			}
+			$stem = strtoupper( (string) preg_replace( '/\..*$/', '', $segment ) );
+			if ( in_array( $stem, $reserved, true ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * True only for regular files that are safe to open and read.
 	 *
 	 * is_file() alone is NOT enough: FIFOs (named pipes), sockets and
@@ -711,6 +981,7 @@ class UWP_Helpers {
 	 * @return bool
 	 */
 	public static function is_regular_file( $path ) {
+		$path = self::win_path( $path );
 		if ( ! is_file( $path ) || is_link( $path ) ) {
 			return false;
 		}
@@ -724,6 +995,7 @@ class UWP_Helpers {
 	 * @param string $dir Absolute path.
 	 */
 	public static function rrmdir( $dir ) {
+		$dir = self::win_path( $dir );
 		if ( ! file_exists( $dir ) ) {
 			return;
 		}
@@ -822,7 +1094,7 @@ class UWP_Helpers {
 		while ( ! empty( $stack ) ) {
 			$current = array_pop( $stack );
 			$order[] = $current;
-			$handle  = @opendir( $current ); // phpcs:ignore
+			$handle  = @opendir( self::win_path( $current ) ); // phpcs:ignore
 			if ( false === $handle ) {
 				continue;
 			}
@@ -831,10 +1103,10 @@ class UWP_Helpers {
 					continue;
 				}
 				$full = $current . DIRECTORY_SEPARATOR . $entry;
-				if ( is_dir( $full ) && ! is_link( $full ) ) {
+				if ( is_dir( self::win_path( $full ) ) && ! is_link( self::win_path( $full ) ) ) {
 					$stack[] = $full;
 				} else {
-					@unlink( $full ); // phpcs:ignore
+					@unlink( self::win_path( $full ) ); // phpcs:ignore
 				}
 				if ( microtime( true ) > $deadline ) {
 					break 2;
@@ -844,13 +1116,200 @@ class UWP_Helpers {
 		}
 		// Remove collected directories deepest-first.
 		foreach ( array_reverse( $order ) as $d ) {
-			@rmdir( $d ); // phpcs:ignore
+			@rmdir( self::win_path( $d ) ); // phpcs:ignore
 			if ( microtime( true ) > $deadline ) {
 				break;
 			}
 		}
 		clearstatcache();
 		return ! file_exists( $dir );
+	}
+
+	/**
+	 * Stream-copy a file (used when rename() crosses filesystems).
+	 *
+	 * @param string $from Source path.
+	 * @param string $to Destination path.
+	 * @return bool True when the full file landed.
+	 */
+	public static function stream_copy( $from, $to ) {
+		$from = self::win_path( $from );
+		$to   = self::win_path( $to );
+		$in = @fopen( $from, 'rb' ); // phpcs:ignore
+		if ( false === $in ) {
+			return false;
+		}
+		$out = @fopen( $to, 'wb' ); // phpcs:ignore
+		if ( false === $out ) {
+			fclose( $in );
+			return false;
+		}
+		$ok = true;
+		while ( ! feof( $in ) ) {
+			$data = fread( $in, UWP_CHUNK_BYTES ); // phpcs:ignore
+			if ( false === $data || '' === $data ) {
+				break;
+			}
+			$len = strlen( $data );
+			$off = 0;
+			while ( $off < $len ) {
+				$w = @fwrite( $out, substr( $data, $off ) ); // phpcs:ignore
+				if ( false === $w || 0 === $w ) {
+					$ok = false;
+					break 2;
+				}
+				$off += $w;
+			}
+		}
+		fclose( $in );
+		fclose( $out );
+		if ( ! $ok ) {
+			@unlink( $to ); // phpcs:ignore - never keep a half copy.
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Move a finished upload from the temp dir into the backups dir.
+	 *
+	 * Uploaded archives used to stay in unboundwp-temp/uploads forever,
+	 * quietly eating quota. Adopting them makes the backup reusable from
+	 * the Backups page - the natural home for it.
+	 *
+	 * @param string $src Absolute path of the uploaded archive.
+	 * @return string Adopted file name, or '' when nothing was moved.
+	 */
+	public static function adopt_upload( $src ) {
+		if ( ! is_file( $src ) ) {
+			return '';
+		}
+		$name = sanitize_file_name( basename( $src ) );
+		if ( ! self::is_supported_archive( $name ) ) {
+			return '';
+		}
+		$dir = uwp_backups_dir();
+		if ( ! file_exists( $dir ) ) {
+			wp_mkdir_p( $dir );
+		}
+		$dest = trailingslashit( $dir ) . $name;
+		if ( file_exists( $dest ) ) {
+			// Never clobber an existing backup with the same name.
+			$ext  = pathinfo( $name, PATHINFO_EXTENSION );
+			$stem = pathinfo( $name, PATHINFO_FILENAME );
+			$name = $stem . '-' . substr( md5( uniqid( '', true ) ), 0, 6 ) . '.' . $ext;
+			$dest = trailingslashit( $dir ) . $name;
+		}
+		if ( @rename( $src, $dest ) ) { // phpcs:ignore
+			return $name;
+		}
+		if ( self::stream_copy( $src, $dest ) ) {
+			@unlink( $src ); // phpcs:ignore
+			return $name;
+		}
+		return '';
+	}
+
+	/**
+	 * Delete abandoned temp work, bounded and best-effort.
+	 *
+	 * Runs at job start (never on front-end requests): crash leftovers,
+	 * uploaded archives nobody imported, stale locks/receipts and rotated
+	 * logs would otherwise accumulate forever. Active jobs are never
+	 * touched - their state files are checked first.
+	 *
+	 * @param int $max_age Seconds a leftover may live before deletion.
+	 * @param array $keep Absolute paths that must never be deleted (e.g. the
+	 *                    archive an import is about to use).
+	 * @return int Number of entries removed.
+	 */
+	public static function prune_temp_orphans( $max_age = 604800, $keep = array() ) { // 7 days.
+		$tmp = uwp_temp_dir();
+		if ( ! is_dir( $tmp ) ) {
+			return 0;
+		}
+		$max_age  = max( 3600, (int) $max_age );
+		$now      = time();
+		$deadline = microtime( true ) + 3;
+		$removed  = 0;
+
+		// Paths that belong to a live job (export/import/verify).
+		$active = array();
+		foreach ( (array) $keep as $path ) {
+			if ( is_string( $path ) && '' !== $path ) {
+				$active[ wp_normalize_path( $path ) ] = true;
+			}
+		}
+		foreach ( array( 'uwp_export_state', 'uwp_import_state', 'uwp_verify_state' ) as $key ) {
+			$state = self::job_load( $key );
+			if ( ! is_array( $state ) ) {
+				continue;
+			}
+			foreach ( array( 'work_dir', 'stage_dir', 'archive', 'sql_path', 'file_list' ) as $field ) {
+				if ( ! empty( $state[ $field ] ) && is_string( $state[ $field ] ) ) {
+					$active[ wp_normalize_path( $state[ $field ] ) ] = true;
+				}
+			}
+		}
+
+		$handle = @opendir( $tmp ); // phpcs:ignore
+		if ( false === $handle ) {
+			return 0;
+		}
+		while ( false !== ( $entry = readdir( $handle ) ) ) {
+			if ( '.' === $entry || '..' === $entry ) {
+				continue;
+			}
+			$full = $tmp . $entry;
+			$norm = wp_normalize_path( $full );
+			if ( isset( $active[ $norm ] ) || ( is_dir( $full ) && isset( $active[ trailingslashit( $norm ) ] ) ) ) {
+				continue;
+			}
+			$age = $now - (int) @filemtime( $full ); // phpcs:ignore
+			if ( $age < $max_age ) {
+				continue;
+			}
+			if ( is_dir( $full ) ) {
+				// Only our own job/trash dirs; never a stranger's folder.
+				if ( preg_match( '/^(export|import|verify)-/', $entry ) || 0 === strpos( $entry, 'trash-' ) ) {
+					self::delete_budgeted( $full, $deadline );
+					$removed++;
+				}
+			} elseif ( preg_match( '/^(done-|fatal-|lock-).*\.(json|txt|lock)$/', $entry )
+				|| preg_match( '/^uwp-log-[A-Za-z0-9_-]+\.log\.1$/', $entry )
+				|| preg_match( '/^uwp-debug\.log\.1$/', $entry ) ) {
+				@unlink( $full ); // phpcs:ignore
+				$removed++;
+			}
+			if ( microtime( true ) > $deadline ) {
+				break;
+			}
+		}
+		closedir( $handle );
+
+		// Uploaded archives nobody imported (their own mtime ages them).
+		$uploads = $tmp . 'uploads';
+		if ( is_dir( $uploads ) ) {
+			$entries = @scandir( $uploads ); // phpcs:ignore
+			foreach ( is_array( $entries ) ? $entries : array() as $file ) {
+				if ( ! self::is_supported_archive( $file ) ) {
+					continue;
+				}
+				$path = $uploads . DIRECTORY_SEPARATOR . $file;
+				if ( isset( $active[ wp_normalize_path( $path ) ] ) ) {
+					continue;
+				}
+				if ( ! is_file( $path ) || ( $now - (int) @filemtime( $path ) ) < $max_age ) { // phpcs:ignore
+					continue;
+				}
+				@unlink( $path ); // phpcs:ignore
+				$removed++;
+			}
+		}
+		if ( $removed > 0 ) {
+			self::debug_log( sprintf( 'housekeeping: removed %d abandoned temp entr(ies)', $removed ) );
+		}
+		return $removed;
 	}
 
 	/**
